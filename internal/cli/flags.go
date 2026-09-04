@@ -326,96 +326,8 @@ func ParseArgs(args []string) (*model.Config, error) {
 		}
 
 		if strings.HasPrefix(arg, "-") && len(arg) > 1 {
-			// Short flags bundle
-			rest := arg[1:]
-			for j := 0; j < len(rest); j++ {
-				ch := rest[j]
-				switch ch {
-				case 'h':
-					cfg.Help = true
-				case 'V':
-					cfg.Version = true
-				case 'i':
-					cfg.CaseMode = model.IgnoreCase
-					cfg.IgnoreCase = true
-					cfg.CaseSensitive = false
-					cfg.SmartCase = false
-				case 's':
-					cfg.CaseMode = model.CaseSensitive
-					cfg.CaseSensitive = true
-					cfg.IgnoreCase = false
-					cfg.SmartCase = false
-				case 'S':
-					cfg.CaseMode = model.SmartCase
-					cfg.SmartCase = true
-					cfg.CaseSensitive = false
-					cfg.IgnoreCase = false
-				case 'F':
-					cfg.FixedStrings = true
-				case 'w':
-					cfg.WordRegexp = true
-				case 'v':
-					cfg.InvertMatch = true
-				case 'n':
-					cfg.LineNumber = true
-				case 'N':
-					cfg.LineNumber = false
-				case 'l':
-					cfg.FilesWithMatches = true
-				case 'c':
-					cfg.Count = true
-				case 'q':
-					cfg.Quiet = true
-				case 'a':
-					cfg.Text = true
-				case 'C', 'A', 'B', 'm', 'g', 't', 'e':
-					var v string
-					if j+1 < len(rest) {
-						v = rest[j+1:]
-						j = len(rest) // consumed the rest
-					} else {
-						if i+1 >= len(args) {
-							return nil, fmt.Errorf("flag '-%c' requires an argument", ch)
-						}
-						v = args[i+1]
-						i++
-					}
-					switch ch {
-					case 'C':
-						n, err := strconv.Atoi(v)
-						if err != nil || n < 0 {
-							return nil, fmt.Errorf("invalid context value '%s': must be a non-negative integer", v)
-						}
-						cfg.BeforeContext = n
-						cfg.AfterContext = n
-					case 'A':
-						n, err := strconv.Atoi(v)
-						if err != nil || n < 0 {
-							return nil, fmt.Errorf("invalid after-context value '%s': must be a non-negative integer", v)
-						}
-						cfg.AfterContext = n
-					case 'B':
-						n, err := strconv.Atoi(v)
-						if err != nil || n < 0 {
-							return nil, fmt.Errorf("invalid before-context value '%s': must be a non-negative integer", v)
-						}
-						cfg.BeforeContext = n
-					case 'm':
-						n, err := strconv.Atoi(v)
-						if err != nil || n < 0 {
-							return nil, fmt.Errorf("invalid max-count value '%s': must be a non-negative integer", v)
-						}
-						cfg.MaxCount = n
-					case 'g':
-						cfg.Globs = append(cfg.Globs, v)
-					case 't':
-						cfg.Types = append(cfg.Types, v)
-					case 'e':
-						cfg.Patterns = append(cfg.Patterns, v)
-					}
-				default:
-					return nil, fmt.Errorf("unknown flag: '-%c'", ch)
-				}
+			if err := parseShortFlags(arg, args, &i, cfg); err != nil {
+				return nil, err
 			}
 			i++
 			continue
@@ -426,62 +338,10 @@ func ParseArgs(args []string) (*model.Config, error) {
 		i++
 	}
 
-	// If help or version requested, return early without validating pattern
-	if cfg.Help || cfg.Version {
-		return cfg, nil
-	}
-
-	// Positional arguments resolution:
-	// Pattern [REV_RANGE] [-- PATHS...]
-	if len(cfg.Patterns) > 0 {
-		cfg.Pattern = cfg.Patterns[0]
-		if len(positional) == 1 {
-			cfg.RevRange = positional[0]
-		} else if len(positional) >= 2 {
-			cfg.RevRange = positional[0]
-			cfg.Paths = append(cfg.Paths, positional[1:]...)
-		}
-	} else {
-		if len(positional) == 0 {
-			return nil, fmt.Errorf("error: pattern is required\n\nUsage: grg [FLAGS] PATTERN [REV_RANGE] [-- PATHS...]\nTry 'grg --help' for more information.")
-		}
-		cfg.Pattern = positional[0]
-		cfg.Patterns = []string{positional[0]}
-		if len(positional) == 2 {
-			cfg.RevRange = positional[1]
-		} else if len(positional) >= 3 {
-			cfg.RevRange = positional[1]
-			cfg.Paths = append(cfg.Paths, positional[2:]...)
-		}
-	}
-
-	// Append any paths specified after "--"
-	if len(pathsAfterDoubleDash) > 0 {
-		cfg.Paths = append(cfg.Paths, pathsAfterDoubleDash...)
+	if err := resolvePositionals(cfg, positional, pathsAfterDoubleDash); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
 }
 
-func parseBool(val string, hasVal bool) (bool, error) {
-	if !hasVal {
-		return true, nil
-	}
-	switch strings.ToLower(val) {
-	case "true", "1", "yes", "on":
-		return true, nil
-	case "false", "0", "no", "off":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid boolean value '%s'", val)
-	}
-}
-
-func isColorChoice(s string) bool {
-	switch strings.ToLower(s) {
-	case "auto", "always", "never", "ansi":
-		return true
-	default:
-		return false
-	}
-}
