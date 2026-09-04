@@ -4,7 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/kryft-dev/grg/internal/model"
 )
+
+// MaxObjectSize defines the upper ceiling for any decompressed Git object (512 MB).
+const MaxObjectSize = model.MaxObjectSize
 
 // ErrObjectNotFound indicates that the requested Git object does not exist.
 var ErrObjectNotFound = errors.New("git object not found")
@@ -62,10 +67,11 @@ func ParseObjectType(s string) ObjectType {
 
 // Object represents an uncompressed Git object.
 type Object struct {
-	OID  string
-	Type ObjectType
-	Size int64
-	Data []byte
+	OID     string
+	Type    ObjectType
+	Size    int64
+	Data    []byte
+	poolBuf *[]byte
 }
 
 // ObjectReader provides read access to Git objects across loose files and packfiles.
@@ -106,20 +112,28 @@ func NewRepositoryReader(repo *RepoInfo) (*RepositoryReader, error) {
 }
 
 // ReadObject looks up an object by OID across loose objects and packfiles.
+// To avoid recursive RLock deadlocks when resolving OBJ_REF_DELTA bases concurrently
+// with Close(), the reader list is snapshotted under RLock and unlocked before reading.
 func (r *RepositoryReader) ReadObject(oid string) (*Object, error) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	loose := r.loose
+	packs := r.packs
+	r.mu.RUnlock()
+
+	if loose == nil && len(packs) == 0 {
+		return nil, fmt.Errorf("%w: repository reader is closed", ErrObjectNotFound)
+	}
 
 	// Check loose objects first
-	if r.loose != nil && r.loose.HasObject(oid) {
-		obj, err := r.loose.ReadObject(oid)
+	if loose != nil && loose.HasObject(oid) {
+		obj, err := loose.ReadObject(oid)
 		if err == nil {
 			return obj, nil
 		}
 	}
 
 	// Check packfiles
-	for _, pack := range r.packs {
+	for _, pack := range packs {
 		if pack.HasObject(oid) {
 			obj, err := pack.ReadObject(oid)
 			if err == nil {
@@ -134,12 +148,14 @@ func (r *RepositoryReader) ReadObject(oid string) (*Object, error) {
 // HasObject checks if an object exists in loose storage or packfiles.
 func (r *RepositoryReader) HasObject(oid string) bool {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	loose := r.loose
+	packs := r.packs
+	r.mu.RUnlock()
 
-	if r.loose != nil && r.loose.HasObject(oid) {
+	if loose != nil && loose.HasObject(oid) {
 		return true
 	}
-	for _, pack := range r.packs {
+	for _, pack := range packs {
 		if pack.HasObject(oid) {
 			return true
 		}
@@ -157,6 +173,7 @@ func (r *RepositoryReader) Close() error {
 		if err := r.loose.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		r.loose = nil
 	}
 	for _, pack := range r.packs {
 		if err := pack.Close(); err != nil && firstErr == nil {
@@ -166,3 +183,4 @@ func (r *RepositoryReader) Close() error {
 	r.packs = nil
 	return firstErr
 }
+

@@ -4,6 +4,9 @@ import (
 	"time"
 )
 
+// MaxObjectSize defines the upper ceiling for any decompressed Git object (512 MB).
+const MaxObjectSize = 512 * 1024 * 1024
+
 // CommitMetadata encapsulates Git commit header and provenance information.
 type CommitMetadata struct {
 	SHA            string    // 40-char (SHA-1) or 64-char (SHA-256) hex commit identifier
@@ -125,3 +128,27 @@ type Config struct {
 
 // SearchOptions is an alias to Config for API flexibility.
 type SearchOptions = Config
+
+// Clone returns a shallow copy of Config with defensively copied slice fields to prevent aliasing.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if c.Patterns != nil {
+		cp.Patterns = append([]string(nil), c.Patterns...)
+	}
+	if c.Globs != nil {
+		cp.Globs = append([]string(nil), c.Globs...)
+	}
+	if c.Types != nil {
+		cp.Types = append([]string(nil), c.Types...)
+	}
+	if c.Paths != nil {
+		cp.Paths = append([]string(nil), c.Paths...)
+	}
+	if c.Branches != nil {
+		cp.Branches = append([]string(nil), c.Branches...)
+	}
+	return &cp
+}

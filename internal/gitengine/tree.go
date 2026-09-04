@@ -83,13 +83,25 @@ func ParseTree(payload []byte) ([]TreeEntry, error) {
 	return entries, nil
 }
 
+const maxTreeDepth = 256
+
 // TraverseTree recursively traverses a Git tree and calls callback for each entry.
 // If callback returns ErrSkipDir for a tree entry, the subtree will not be descended into.
 func TraverseTree(reader ObjectReader, rootOID string, callback func(path string, entry TreeEntry) error) error {
-	return traverseTreeHelper(reader, rootOID, "", callback)
+	visited := make(map[string]bool)
+	return traverseTreeHelper(reader, rootOID, "", 0, visited, callback)
 }
 
-func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, callback func(path string, entry TreeEntry) error) error {
+func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, depth int, visited map[string]bool, callback func(path string, entry TreeEntry) error) error {
+	if depth > maxTreeDepth {
+		return fmt.Errorf("%w: tree depth exceeds maximum of %d", ErrCorruptObject, maxTreeDepth)
+	}
+	if visited[treeOID] {
+		return fmt.Errorf("%w: circular tree reference detected at %s", ErrCorruptObject, treeOID)
+	}
+	visited[treeOID] = true
+	defer delete(visited, treeOID)
+
 	obj, err := reader.ReadObject(treeOID)
 	if err != nil {
 		return fmt.Errorf("failed to read tree %s: %w", treeOID, err)
@@ -120,7 +132,7 @@ func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, callback fu
 		}
 
 		if entry.IsTree() {
-			if err := traverseTreeHelper(reader, entry.OID, entryPath, callback); err != nil {
+			if err := traverseTreeHelper(reader, entry.OID, entryPath, depth+1, visited, callback); err != nil {
 				return err
 			}
 		}

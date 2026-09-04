@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -60,7 +61,21 @@ func ParsePackIndex(data []byte) (*PackIndex, error) {
 		idx.fanout[i] = binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
 	}
+	for i := 1; i < 256; i++ {
+		if idx.fanout[i] < idx.fanout[i-1] {
+			return nil, fmt.Errorf("%w: non-monotonic fanout table at %d", ErrIdxInvalid, i)
+		}
+	}
 	idx.count = int(idx.fanout[255])
+	if idx.count < 0 {
+		return nil, fmt.Errorf("%w: negative object count %d in fanout", ErrIdxInvalid, idx.count)
+	}
+
+	// Validate data length can hold: 8 (header) + 1024 (fanout) + count*(hashLen + 4 + 4) + 40 (trailer)
+	minRequiredLen := int64(8+1024) + int64(idx.count)*int64(idx.hashLen+4+4) + 40
+	if int64(len(data)) < minRequiredLen {
+		return nil, fmt.Errorf("%w: truncated pack index for %d objects (need %d bytes, got %d)", ErrIdxInvalid, idx.count, minRequiredLen, len(data))
+	}
 
 	if idx.count == 0 {
 		return idx, nil
@@ -82,7 +97,8 @@ func ParsePackIndex(data []byte) (*PackIndex, error) {
 	pos += crcBytesLen
 
 	// 5. 4-byte offset table (count * 4 bytes)
-	if pos+crcBytesLen > len(data) {
+	offsetBytesLen := idx.count * 4
+	if pos+offsetBytesLen > len(data) {
 		return nil, fmt.Errorf("%w: truncated offset table", ErrIdxInvalid)
 	}
 	idx.offsets = make([]uint32, idx.count)
@@ -115,9 +131,14 @@ func (idx *PackIndex) FindOffset(oid string) (int64, error) {
 		return -1, ErrObjectNotFound
 	}
 
-	sha, err := hex.DecodeString(oid)
-	if err != nil || len(sha) != idx.hashLen {
-		return -1, fmt.Errorf("invalid OID %q for pack index lookup", oid)
+	if len(oid) != idx.hashLen*2 {
+		return -1, fmt.Errorf("invalid OID length %d for pack index lookup", len(oid))
+	}
+
+	var shaBuf [32]byte
+	sha := shaBuf[:idx.hashLen]
+	if _, err := hex.Decode(sha, []byte(oid)); err != nil {
+		return -1, fmt.Errorf("invalid OID %q for pack index lookup: %w", oid, err)
 	}
 
 	firstByte := int(sha[0])
@@ -148,7 +169,11 @@ func (idx *PackIndex) FindOffset(oid string) (int64, error) {
 			if idx64 >= len(idx.offsets64) {
 				return -1, fmt.Errorf("%w: invalid 64-bit offset index %d", ErrIdxInvalid, idx64)
 			}
-			return int64(idx.offsets64[idx64]), nil
+			off64 := idx.offsets64[idx64]
+			if off64 > math.MaxInt64 {
+				return -1, fmt.Errorf("%w: 64-bit offset %d exceeds max int64", ErrIdxInvalid, off64)
+			}
+			return int64(off64), nil
 		}
 	}
 

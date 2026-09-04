@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"fmt"
 	"regexp"
+	"slices"
 
 	"github.com/kryft-dev/grg/internal/model"
 )
@@ -97,7 +98,48 @@ func (w *HistoryWalker) walkCommitBlobs(commit *model.CommitMetadata, seenBlobOc
 	})
 }
 
+// compareTreeEntries compares two TreeEntry items using Git's canonical tree sort order:
+// compares entry names, with directories sorting as if ending with '/'.
+func compareTreeEntries(a, b TreeEntry) int {
+	len1 := len(a.Name)
+	len2 := len(b.Name)
+	minLen := len1
+	if len2 < minLen {
+		minLen = len2
+	}
+	for i := 0; i < minLen; i++ {
+		c1 := a.Name[i]
+		c2 := b.Name[i]
+		if c1 != c2 {
+			if c1 < c2 {
+				return -1
+			}
+			return 1
+		}
+	}
+	var c1 byte
+	if len1 > minLen {
+		c1 = a.Name[minLen]
+	} else if a.IsTree() {
+		c1 = '/'
+	}
+	var c2 byte
+	if len2 > minLen {
+		c2 = b.Name[minLen]
+	} else if b.IsTree() {
+		c2 = '/'
+	}
+	if c1 < c2 {
+		return -1
+	}
+	if c1 > c2 {
+		return 1
+	}
+	return 0
+}
+
 // diffTreesAndEmit performs subtree-pruned tree comparison between oldTreeOID and newTreeOID.
+// Leverages canonical sorted tree entry order with a two-pointer merge to eliminate map allocations.
 func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
 	if oldTreeOID == newTreeOID {
 		// Subtree OID match: prune subtree descending entirely!
@@ -120,13 +162,34 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 		return err
 	}
 
-	oldMap := make(map[string]TreeEntry, len(oldEntries))
-	for _, e := range oldEntries {
-		oldMap[e.Name] = e
+	if !slices.IsSortedFunc(oldEntries, compareTreeEntries) {
+		slices.SortFunc(oldEntries, compareTreeEntries)
+	}
+	if !slices.IsSortedFunc(newEntries, compareTreeEntries) {
+		slices.SortFunc(newEntries, compareTreeEntries)
 	}
 
+	i := 0
 	for _, newEntry := range newEntries {
-		oldEntry, hasOld := oldMap[newEntry.Name]
+		var (
+			hasOld   bool
+			oldEntry TreeEntry
+		)
+
+		for i < len(oldEntries) {
+			cmp := compareTreeEntries(oldEntries[i], newEntry)
+			if cmp < 0 {
+				i++
+			} else if cmp == 0 {
+				hasOld = true
+				oldEntry = oldEntries[i]
+				i++
+				break
+			} else {
+				break
+			}
+		}
+
 		if hasOld && oldEntry.OID == newEntry.OID {
 			// Identical entry OID: subtree/blob unchanged, prune!
 			continue
@@ -148,50 +211,7 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 				return err
 			}
 		} else if newEntry.IsBlob() {
-			if w.pathFilter != nil && !w.pathFilter(entryPath) {
-				continue
-			}
-
-			// In full DAG traversal, a merge commit does not introduce a blob
-			// if that blob was already present in another parent branch.
-			if len(commit.Parents) > 1 && !w.cfg.FirstParent {
-				inOtherParent := false
-				for _, pSHA := range commit.Parents[1:] {
-					pMeta := w.readCommit(pSHA)
-					if pMeta != nil {
-						if pe, ok := FindTreeEntry(w.reader, pMeta.TreeOID, entryPath); ok && pe.OID == newEntry.OID {
-							inOtherParent = true
-							break
-						}
-					}
-				}
-				if inOtherParent {
-					continue
-				}
-			}
-
-			key := newEntry.OID + ":" + entryPath
-			if !w.cfg.ExpandCommits {
-				if seenBlobOcc[key] {
-					continue
-				}
-				seenBlobOcc[key] = true
-			}
-
-			author := commit.AuthorName
-			if author == "" {
-				author = commit.Author
-			}
-			if err := fn(model.BlobOccurrence{
-				BlobOID:       newEntry.OID,
-				Path:          entryPath,
-				CommitSHA:     commit.SHA,
-				CommitDate:    commit.Date,
-				Mode:          newEntry.Mode,
-				CommitSummary: commit.Summary,
-				CommitAuthor:  author,
-				Commit:        commit,
-			}); err != nil {
+			if err := w.emitBlobOccurrence(newEntry, entryPath, commit, seenBlobOcc, fn); err != nil {
 				return err
 			}
 		}
@@ -200,13 +220,64 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 	return nil
 }
 
+func (w *HistoryWalker) emitBlobOccurrence(newEntry TreeEntry, entryPath string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
+	if w.pathFilter != nil && !w.pathFilter(entryPath) {
+		return nil
+	}
+
+	// In full DAG traversal, a merge commit does not introduce a blob
+	// if that blob was already present in another parent branch.
+	if len(commit.Parents) > 1 && !w.cfg.FirstParent {
+		inOtherParent := false
+		for _, pSHA := range commit.Parents[1:] {
+			pMeta := w.readCommit(pSHA)
+			if pMeta != nil {
+				if pe, ok := FindTreeEntry(w.reader, pMeta.TreeOID, entryPath); ok && pe.OID == newEntry.OID {
+					inOtherParent = true
+					break
+				}
+			}
+		}
+		if inOtherParent {
+			return nil
+		}
+	}
+
+	key := newEntry.OID + ":" + entryPath
+	if !w.cfg.ExpandCommits {
+		if seenBlobOcc[key] {
+			return nil
+		}
+		seenBlobOcc[key] = true
+	}
+
+	author := commit.AuthorName
+	if author == "" {
+		author = commit.Author
+	}
+	return fn(model.BlobOccurrence{
+		BlobOID:       newEntry.OID,
+		Path:          entryPath,
+		CommitSHA:     commit.SHA,
+		CommitDate:    commit.Date,
+		Mode:          newEntry.Mode,
+		CommitSummary: commit.Summary,
+		CommitAuthor:  author,
+		Commit:        commit,
+	})
+}
+
 // commitHeap implements a priority queue ordered by commit date descending.
 type commitHeap []*model.CommitMetadata
 
 func (h commitHeap) Len() int           { return len(h) }
 func (h commitHeap) Less(i, j int) bool { return h[i].Date.After(h[j].Date) }
 func (h commitHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *commitHeap) Push(x any)        { *h = append(*h, x.(*model.CommitMetadata)) }
+func (h *commitHeap) Push(x any) {
+	if item, ok := x.(*model.CommitMetadata); ok {
+		*h = append(*h, item)
+	}
+}
 func (h *commitHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -279,7 +350,11 @@ func (w *HistoryWalker) collectOrderedCommits() ([]*model.CommitMetadata, error)
 
 	var matchedCommits []*model.CommitMetadata
 	for pq.Len() > 0 {
-		commit := heap.Pop(pq).(*model.CommitMetadata)
+		popped := heap.Pop(pq)
+		commit, ok := popped.(*model.CommitMetadata)
+		if !ok {
+			continue
+		}
 
 		if MatchesCommitFilters(commit, w.cfg, authorRe, committerRe, sinceTime, untilTime) {
 			matchedCommits = append(matchedCommits, commit)
@@ -314,17 +389,26 @@ func (w *HistoryWalker) readCommit(sha string) *model.CommitMetadata {
 	return meta
 }
 
-func (w *HistoryWalker) traverseExclude(sha string, excluded map[string]bool) {
-	if excluded[sha] {
-		return
-	}
-	excluded[sha] = true
-	meta := w.readCommit(sha)
-	if meta == nil {
-		return
-	}
-	for _, parent := range meta.Parents {
-		w.traverseExclude(parent, excluded)
+func (w *HistoryWalker) traverseExclude(startSHA string, excluded map[string]bool) {
+	stack := []string{startSHA}
+	for len(stack) > 0 {
+		n := len(stack) - 1
+		sha := stack[n]
+		stack = stack[:n]
+
+		if excluded[sha] {
+			continue
+		}
+		excluded[sha] = true
+		meta := w.readCommit(sha)
+		if meta == nil {
+			continue
+		}
+		for _, parent := range meta.Parents {
+			if !excluded[parent] {
+				stack = append(stack, parent)
+			}
+		}
 	}
 }
 

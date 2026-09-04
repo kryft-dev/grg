@@ -22,7 +22,13 @@ var deltaBufferPool = sync.Pool{
 
 // GetDeltaBuffer returns a pooled byte slice buffer with capacity for delta decoding.
 func GetDeltaBuffer() *[]byte {
-	return deltaBufferPool.Get().(*[]byte)
+	if pooled := deltaBufferPool.Get(); pooled != nil {
+		if b, ok := pooled.(*[]byte); ok && b != nil {
+			return b
+		}
+	}
+	b := make([]byte, 0, 64*1024)
+	return &b
 }
 
 // PutDeltaBuffer returns a delta buffer to the pool after resetting length to 0.
@@ -45,6 +51,9 @@ func ReadDeltaHeader(delta []byte) (baseSize int, targetSize int, bytesRead int,
 		if pos >= len(delta) {
 			return 0, 0, 0, fmt.Errorf("%w: truncated base size header", ErrDeltaCorrupt)
 		}
+		if shift >= 64 {
+			return 0, 0, 0, fmt.Errorf("%w: LEB128 shift overflow in base size", ErrDeltaCorrupt)
+		}
 		b := delta[pos]
 		pos++
 		baseSize |= int(b&0x7f) << shift
@@ -60,6 +69,9 @@ func ReadDeltaHeader(delta []byte) (baseSize int, targetSize int, bytesRead int,
 		if pos >= len(delta) {
 			return 0, 0, 0, fmt.Errorf("%w: truncated target size header", ErrDeltaCorrupt)
 		}
+		if shift >= 64 {
+			return 0, 0, 0, fmt.Errorf("%w: LEB128 shift overflow in target size", ErrDeltaCorrupt)
+		}
 		b := delta[pos]
 		pos++
 		targetSize |= int(b&0x7f) << shift
@@ -67,6 +79,10 @@ func ReadDeltaHeader(delta []byte) (baseSize int, targetSize int, bytesRead int,
 		if (b & 0x80) == 0 {
 			break
 		}
+	}
+
+	if baseSize < 0 || int64(baseSize) > MaxObjectSize || targetSize < 0 || int64(targetSize) > MaxObjectSize {
+		return 0, 0, 0, fmt.Errorf("%w: invalid delta object size: base=%d target=%d", ErrDeltaCorrupt, baseSize, targetSize)
 	}
 
 	return baseSize, targetSize, pos, nil
@@ -175,12 +191,12 @@ func applyDeltaInstructions(target []byte, base, instructions []byte, targetSize
 				size = 0x10000 // 64KB per Git pack spec
 			}
 
-			end := int(offset + size)
-			if int(offset) > len(base) || end > len(base) {
+			end := uint64(offset) + uint64(size)
+			if uint64(offset) > uint64(len(base)) || end > uint64(len(base)) {
 				return nil, fmt.Errorf("%w: copy out of bounds [offset=%d size=%d baseLen=%d]", ErrDeltaCorrupt, offset, size, len(base))
 			}
 
-			target = append(target, base[offset:end]...)
+			target = append(target, base[offset:int(end)]...)
 		} else if cmd > 0 {
 			// INSERT instruction: literal bytes from delta stream
 			size := int(cmd & 0x7f)

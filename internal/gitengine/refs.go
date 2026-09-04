@@ -38,6 +38,11 @@ func resolveRefRecursive(repo *RepoInfo, ref string, depth int) (string, error) 
 		return ref, nil
 	}
 
+	// Validate ref syntax against path traversal and Git rules
+	if !isValidRefName(ref) {
+		return "", fmt.Errorf("%w: invalid ref name %q", ErrInvalidRef, ref)
+	}
+
 	// 2. Candidate paths in precedence order
 	var candidates []string
 	if strings.HasPrefix(ref, "refs/") || ref == "HEAD" {
@@ -62,7 +67,11 @@ func resolveRefRecursive(repo *RepoInfo, ref string, depth int) (string, error) 
 		}
 		if found {
 			if strings.HasPrefix(oid, "ref: ") {
-				return resolveRefRecursive(repo, strings.TrimPrefix(oid, "ref: "), depth+1)
+				symRef := strings.TrimSpace(strings.TrimPrefix(oid, "ref: "))
+				if !isValidRefName(symRef) {
+					return "", fmt.Errorf("%w: invalid symbolic ref target %q", ErrInvalidRef, symRef)
+				}
+				return resolveRefRecursive(repo, symRef, depth+1)
 			}
 			return oid, nil
 		}
@@ -75,7 +84,11 @@ func resolveRefRecursive(repo *RepoInfo, ref string, depth int) (string, error) 
 			}
 			if found {
 				if strings.HasPrefix(oid, "ref: ") {
-					return resolveRefRecursive(repo, strings.TrimPrefix(oid, "ref: "), depth+1)
+					symRef := strings.TrimSpace(strings.TrimPrefix(oid, "ref: "))
+					if !isValidRefName(symRef) {
+						return "", fmt.Errorf("%w: invalid symbolic ref target %q", ErrInvalidRef, symRef)
+					}
+					return resolveRefRecursive(repo, symRef, depth+1)
 				}
 				return oid, nil
 			}
@@ -97,8 +110,40 @@ func resolveRefRecursive(repo *RepoInfo, ref string, depth int) (string, error) 
 	return "", fmt.Errorf("%w: %s", ErrRefNotFound, ref)
 }
 
+func isValidRefName(ref string) bool {
+	if ref == "" || ref == "." || ref == ".." {
+		return false
+	}
+	// Cannot contain directory traversal components
+	if strings.Contains(ref, "..") || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "//") {
+		return false
+	}
+	if strings.Contains(ref, "\\") || strings.HasSuffix(ref, ".lock") {
+		return false
+	}
+	// Git check-ref-format rules: no ASCII control chars, spaces, ~, ^, :, ?, *, [, @{
+	for i := 0; i < len(ref); i++ {
+		c := ref[i]
+		if c <= 0x20 || c == 0x7f || c == '~' || c == '^' || c == ':' || c == '?' || c == '*' || c == '[' {
+			return false
+		}
+	}
+	return !strings.Contains(ref, "@{")
+}
+
 func readLooseRef(baseDir, relPath string) (string, bool, error) {
-	fullPath := filepath.Join(baseDir, filepath.FromSlash(relPath))
+	relClean := filepath.Clean(filepath.FromSlash(relPath))
+	if filepath.IsAbs(relClean) || relClean == "." || relClean == ".." || strings.HasPrefix(relClean, ".."+string(filepath.Separator)) {
+		return "", false, fmt.Errorf("%w: path traversal detected in ref %q", ErrInvalidRef, relPath)
+	}
+
+	fullPath := filepath.Join(baseDir, relClean)
+	// Ensure resolved fullPath is strictly inside baseDir
+	rel, err := filepath.Rel(baseDir, fullPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false, fmt.Errorf("%w: path traversal detected in ref %q", ErrInvalidRef, relPath)
+	}
+
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

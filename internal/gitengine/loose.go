@@ -28,7 +28,7 @@ func NewLooseReader(commonGitDir string) *LooseReader {
 
 // objectPath returns the filesystem path for a loose Git object by OID.
 func (r *LooseReader) objectPath(oid string) string {
-	if len(oid) < 4 {
+	if !isHexOID(oid) {
 		return ""
 	}
 	return filepath.Join(r.objectsDir, oid[:2], oid[2:])
@@ -36,6 +36,9 @@ func (r *LooseReader) objectPath(oid string) string {
 
 // HasObject returns true if the loose object file exists on disk.
 func (r *LooseReader) HasObject(oid string) bool {
+	if !isHexOID(oid) {
+		return false
+	}
 	path := r.objectPath(oid)
 	if path == "" {
 		return false
@@ -46,6 +49,9 @@ func (r *LooseReader) HasObject(oid string) bool {
 
 // ReadObject reads, decompresses, and parses a loose Git object by OID.
 func (r *LooseReader) ReadObject(oid string) (*Object, error) {
+	if !isHexOID(oid) {
+		return nil, fmt.Errorf("%w: invalid OID %q", ErrObjectNotFound, oid)
+	}
 	path := r.objectPath(oid)
 	if path == "" {
 		return nil, fmt.Errorf("%w: invalid OID %q", ErrObjectNotFound, oid)
@@ -62,9 +68,12 @@ func (r *LooseReader) ReadObject(oid string) (*Object, error) {
 
 	var zReader io.ReadCloser
 	if pooled := r.zlibPool.Get(); pooled != nil {
-		zr := pooled.(zlib.Resetter)
-		if resetErr := zr.Reset(f, nil); resetErr == nil {
-			zReader = pooled.(io.ReadCloser)
+		if zr, ok := pooled.(zlib.Resetter); ok {
+			if resetErr := zr.Reset(f, nil); resetErr == nil {
+				if rc, ok := pooled.(io.ReadCloser); ok {
+					zReader = rc
+				}
+			}
 		}
 	}
 
@@ -99,12 +108,13 @@ func (r *LooseReader) ReadObject(oid string) (*Object, error) {
 	}
 	sizeStr := string(sizeBytes[:len(sizeBytes)-1])
 	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil || size < 0 {
+	if err != nil || size < 0 || size > MaxObjectSize {
 		return nil, fmt.Errorf("%w: invalid loose object size %q for %s: %v", ErrCorruptObject, sizeStr, oid, err)
 	}
 
 	payload := make([]byte, size)
-	if _, err := io.ReadFull(br, payload); err != nil {
+	limitedReader := io.LimitReader(br, size)
+	if _, err := io.ReadFull(limitedReader, payload); err != nil {
 		return nil, fmt.Errorf("%w: unexpected EOF reading loose object data for %s: %v", ErrCorruptObject, oid, err)
 	}
 

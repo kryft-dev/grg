@@ -131,28 +131,58 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 		return nil, fmt.Errorf("%w: delta chain exceeds maximum depth of %d", ErrCorruptObject, maxDeltaDepth)
 	}
 
-	sr := io.NewSectionReader(p.file, offset, p.fileSize-offset)
-
-	// 1. Read object header
-	b := make([]byte, 1)
-	if _, err := sr.Read(b); err != nil {
-		return nil, fmt.Errorf("%w: failed to read object header: %v", ErrCorruptObject, err)
+	if offset < 0 || offset >= p.fileSize {
+		return nil, fmt.Errorf("%w: offset %d out of bounds (packfile size %d)", ErrCorruptObject, offset, p.fileSize)
 	}
 
-	objType := ObjectType((b[0] >> 4) & 7)
-	size := int64(b[0] & 0x0f)
+	// 1. Read object header using a stack buffer to eliminate 1-byte allocations and multiple pread syscalls
+	var hdrBuf [64]byte
+	avail := p.fileSize - offset
+	toRead := len(hdrBuf)
+	if int64(toRead) > avail {
+		toRead = int(avail)
+	}
+	if toRead == 0 {
+		return nil, fmt.Errorf("%w: unexpected EOF reading header at offset %d", ErrCorruptObject, offset)
+	}
+
+	n, err := p.file.ReadAt(hdrBuf[:toRead], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: failed to read object header at %d: %v", ErrCorruptObject, offset, err)
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: empty read at offset %d", ErrCorruptObject, offset)
+	}
+
+	pos := 0
+	b := hdrBuf[pos]
+	pos++
+
+	objType := ObjectType((b >> 4) & 7)
+	size := int64(b & 0x0f)
 	shift := uint(4)
 
-	for (b[0] & 0x80) != 0 {
-		if _, err := sr.Read(b); err != nil {
-			return nil, fmt.Errorf("%w: truncated object size in header: %v", ErrCorruptObject, err)
+	for (b & 0x80) != 0 {
+		if shift >= 64 {
+			return nil, fmt.Errorf("%w: varint shift overflow at offset %d", ErrCorruptObject, offset)
 		}
-		size |= int64(b[0]&0x7f) << shift
+		if pos >= n {
+			return nil, fmt.Errorf("%w: truncated object size in header at %d", ErrCorruptObject, offset)
+		}
+		b = hdrBuf[pos]
+		pos++
+		size |= int64(b&0x7f) << shift
 		shift += 7
+	}
+
+	if size < 0 || size > MaxObjectSize {
+		return nil, fmt.Errorf("%w: invalid object size %d at offset %d", ErrCorruptObject, size, offset)
 	}
 
 	switch objType {
 	case TypeCommit, TypeTree, TypeBlob, TypeTag:
+		dataOffset := offset + int64(pos)
+		sr := io.NewSectionReader(p.file, dataOffset, p.fileSize-dataOffset)
 		data, err := p.decompressZlib(sr, size)
 		if err != nil {
 			return nil, err
@@ -164,22 +194,32 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 		}, nil
 
 	case TypeOfsDelta:
-		// Read negative offset to base object
-		if _, err := sr.Read(b); err != nil {
-			return nil, fmt.Errorf("%w: failed to read ofs_delta offset: %v", ErrCorruptObject, err)
+		if pos >= n {
+			return nil, fmt.Errorf("%w: truncated ofs_delta offset at %d", ErrCorruptObject, offset)
 		}
-		offsetDelta := int64(b[0] & 0x7f)
-		for (b[0] & 0x80) != 0 {
-			if _, err := sr.Read(b); err != nil {
-				return nil, fmt.Errorf("%w: truncated ofs_delta offset: %v", ErrCorruptObject, err)
+		b = hdrBuf[pos]
+		pos++
+		offsetDelta := int64(b & 0x7f)
+		shiftCount := 0
+		for (b & 0x80) != 0 {
+			shiftCount++
+			if shiftCount > 10 {
+				return nil, fmt.Errorf("%w: ofs_delta offset shift overflow at %d", ErrCorruptObject, offset)
 			}
-			offsetDelta = ((offsetDelta + 1) << 7) | int64(b[0]&0x7f)
+			if pos >= n {
+				return nil, fmt.Errorf("%w: truncated ofs_delta offset at %d", ErrCorruptObject, offset)
+			}
+			b = hdrBuf[pos]
+			pos++
+			offsetDelta = ((offsetDelta + 1) << 7) | int64(b&0x7f)
 		}
 		baseOffset := offset - offsetDelta
 		if baseOffset < 0 || baseOffset >= offset {
 			return nil, fmt.Errorf("%w: invalid base offset %d", ErrCorruptObject, baseOffset)
 		}
 
+		dataOffset := offset + int64(pos)
+		sr := io.NewSectionReader(p.file, dataOffset, p.fileSize-dataOffset)
 		deltaBytes, err := p.decompressZlib(sr, size)
 		if err != nil {
 			return nil, err
@@ -190,24 +230,44 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 			return nil, fmt.Errorf("failed to read base object for ofs_delta: %w", err)
 		}
 
-		targetData, err := ApplyDelta(baseObj.Data, deltaBytes)
+		deltaBuf := GetDeltaBuffer()
+		targetData, err := ApplyDeltaWithBuffer(*deltaBuf, baseObj.Data, deltaBytes)
+		if baseObj.poolBuf != nil {
+			PutDeltaBuffer(baseObj.poolBuf)
+			baseObj.poolBuf = nil
+		}
 		if err != nil {
+			PutDeltaBuffer(deltaBuf)
 			return nil, fmt.Errorf("failed to apply ofs_delta: %w", err)
 		}
 
+		if depth > 0 {
+			return &Object{
+				Type:    baseObj.Type,
+				Size:    int64(len(targetData)),
+				Data:    targetData,
+				poolBuf: deltaBuf,
+			}, nil
+		}
+
+		finalData := append([]byte(nil), targetData...)
+		PutDeltaBuffer(deltaBuf)
 		return &Object{
 			Type: baseObj.Type,
-			Size: int64(len(targetData)),
-			Data: targetData,
+			Size: int64(len(finalData)),
+			Data: finalData,
 		}, nil
 
 	case TypeRefDelta:
-		shaBuf := make([]byte, p.idx.hashLen)
-		if _, err := io.ReadFull(sr, shaBuf); err != nil {
-			return nil, fmt.Errorf("%w: truncated base SHA in ref_delta: %v", ErrCorruptObject, err)
+		shaLen := p.idx.hashLen
+		if pos+shaLen > n {
+			return nil, fmt.Errorf("%w: truncated base SHA in ref_delta at %d", ErrCorruptObject, offset)
 		}
-		baseOID := hex.EncodeToString(shaBuf)
+		baseOID := hex.EncodeToString(hdrBuf[pos : pos+shaLen])
+		pos += shaLen
 
+		dataOffset := offset + int64(pos)
+		sr := io.NewSectionReader(p.file, dataOffset, p.fileSize-dataOffset)
 		deltaBytes, err := p.decompressZlib(sr, size)
 		if err != nil {
 			return nil, err
@@ -223,15 +283,32 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 			return nil, fmt.Errorf("failed to resolve base object %s for ref_delta: %w", baseOID, err)
 		}
 
-		targetData, err := ApplyDelta(baseObj.Data, deltaBytes)
+		deltaBuf := GetDeltaBuffer()
+		targetData, err := ApplyDeltaWithBuffer(*deltaBuf, baseObj.Data, deltaBytes)
+		if baseObj.poolBuf != nil {
+			PutDeltaBuffer(baseObj.poolBuf)
+			baseObj.poolBuf = nil
+		}
 		if err != nil {
+			PutDeltaBuffer(deltaBuf)
 			return nil, fmt.Errorf("failed to apply ref_delta: %w", err)
 		}
 
+		if depth > 0 {
+			return &Object{
+				Type:    baseObj.Type,
+				Size:    int64(len(targetData)),
+				Data:    targetData,
+				poolBuf: deltaBuf,
+			}, nil
+		}
+
+		finalData := append([]byte(nil), targetData...)
+		PutDeltaBuffer(deltaBuf)
 		return &Object{
 			Type: baseObj.Type,
-			Size: int64(len(targetData)),
-			Data: targetData,
+			Size: int64(len(finalData)),
+			Data: finalData,
 		}, nil
 
 	default:
@@ -241,14 +318,36 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 
 // decompressZlib reads and decompresses size bytes using a pooled or new zlib reader.
 func (p *PackReader) decompressZlib(r io.Reader, size int64) ([]byte, error) {
-	zr, err := zlib.NewReader(r)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to init zlib decompressor: %v", ErrCorruptObject, err)
+	if size < 0 || size > MaxObjectSize {
+		return nil, fmt.Errorf("%w: object size %d exceeds limit", ErrCorruptObject, size)
 	}
-	defer zr.Close()
+
+	var zReader io.ReadCloser
+	if pooled := p.zlibPool.Get(); pooled != nil {
+		if zr, ok := pooled.(zlib.Resetter); ok {
+			if resetErr := zr.Reset(r, nil); resetErr == nil {
+				if rc, ok := pooled.(io.ReadCloser); ok {
+					zReader = rc
+				}
+			}
+		}
+	}
+
+	if zReader == nil {
+		var zErr error
+		zReader, zErr = zlib.NewReader(r)
+		if zErr != nil {
+			return nil, fmt.Errorf("%w: failed to init zlib decompressor: %v", ErrCorruptObject, zErr)
+		}
+	}
+	defer func() {
+		_ = zReader.Close()
+		p.zlibPool.Put(zReader)
+	}()
 
 	buf := make([]byte, size)
-	if _, err := io.ReadFull(zr, buf); err != nil {
+	limited := io.LimitReader(zReader, size)
+	if _, err := io.ReadFull(limited, buf); err != nil {
 		return nil, fmt.Errorf("%w: failed reading decompressed pack object: %v", ErrCorruptObject, err)
 	}
 	return buf, nil
