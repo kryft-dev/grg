@@ -1,0 +1,19 @@
+# Compiled binaries
+grg
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts and coverage
+*.test
+*.out
+coverage.txt
+profile.out
+
+# OS / Editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
