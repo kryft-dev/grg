@@ -42,6 +42,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X github.com/kryft-dev/grg/internal/cli.AppVersion={{.Version}}
+      - -X github.com/kryft-dev/grg/internal/cli.GitCommit={{.Commit}}
 
 archives:
   - id: default

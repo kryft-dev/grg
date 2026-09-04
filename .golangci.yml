@@ -1,0 +1,130 @@
+version: "2"
+
+run:
+  concurrency: 4
+  timeout: 5m
+  tests: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  enable:
+    # Correctness & Safety
+    - govet
+    - staticcheck
+    - unused
+    - errcheck
+    - nilerr
+    - unconvert
+    - misspell
+    - ineffassign
+    - copyloopvar
+    - durationcheck
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - dupword
+    - reassign
+    - nolintlint
+    # Security
+    - gosec
+
+  disable:
+    - lll
+    - prealloc
+    - wrapcheck
+    - err113
+    - mnd
+    - iface
+    - nakedret
+    - noinlineerr
+    - gocognit
+    - cyclop
+    - depguard
+    - goheader
+    - importas
+    - funcorder
+    - godoclint
+    - varnamelen
+    - exhaustruct
+    - gochecknoglobals
+    - gochecknoinits
+    - unparam
+    - makezero
+    - testpackage
+    - embeddedstructfieldcheck
+    - iotamixing
+    - unqueryvet
+    - recvcheck
+    - mirror
+    - protogetter
+    - spancheck
+    - zerologlint
+    - wsl_v5
+    - paralleltest
+
+  exclusions:
+    rules:
+      # Gosec: Git object hashing requires SHA-1 by protocol specification (G401, G505)
+      - linters:
+          - gosec
+        text: "G401|G505"
+
+      # Gosec: Subprocess execution, file permissions, and integer casts in tests and benchmarks
+      - linters:
+          - gosec
+        path: (_test\.go|test/)
+        text: "G204|G301|G304|G306|G115"
+
+      # Gosec: Temporary waiver for pre-existing path/integer issues in gitengine (scheduled for Wave 3 Track C)
+      - linters:
+          - gosec
+        path: internal/gitengine/(discovery|loose|pack|pack_index|refs)\.go
+        text: "G304|G703|G115"
+
+      # Errcheck: Writing CLI help and version output to standard output
+      - linters:
+          - errcheck
+        path: cmd/grg/main\.go
+        text: "Error return value of `fmt\\.Fprint"
+
+      # Errcheck: Deferred Close on read-only file/stream readers
+      - linters:
+          - errcheck
+        text: "Error return value of `.*\\.Close` is not checked"
+
+      # Ineffassign & Staticcheck SA4006: Temporary suppression for aggregator commitMap lookup (Wave 3 Track B)
+      - linters:
+          - ineffassign
+          - staticcheck
+        path: internal/aggregator/aggregator\.go
+        text: "(ineffectual assignment to cm|SA4006)"
+
+      # Unused: zlibPool field in PackReader is reserved for Wave 3 Track C reader pooling
+      - linters:
+          - unused
+        path: internal/gitengine/pack\.go
+        text: "field zlibPool is unused"
+
+      # Staticcheck: Empty branch in integration test awaiting Wave 3 exit code assertion
+      - linters:
+          - staticcheck
+        path: test/integration/flags_test\.go
+        text: "SA9003"
+
+      # Staticcheck: Style and simplification suggestions deferred to Wave 4 modernization
+      - linters:
+          - staticcheck
+        text: "ST1005|ST1023|QF1001|QF1011|QF1012"
+
+      # Dupword: Test fixtures may contain consecutive identical tokens across lines
+      - linters:
+          - dupword
+        path: (_test\.go|test/)
+
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true

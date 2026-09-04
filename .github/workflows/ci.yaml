@@ -6,10 +6,53 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Golangci-Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+  security:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+          cache: true
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: 'go.mod'
+
   test:
     name: Checks and Tests
     runs-on: ubuntu-latest
@@ -24,11 +67,19 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: Run go vet
-        run: go vet ./...
+      - name: Verify module dependencies
+        run: |
+          go mod verify
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Run tests with race detector
-        run: go test -v -race -count=1 ./...
+        run: |
+          go test -v -race -shuffle=on -count=1 -coverprofile=coverage.out ./...
 
-      - name: Build grg binary
-        run: go build ./cmd/grg
+      - name: Build all packages
+        run: |
+          go build -v ./...

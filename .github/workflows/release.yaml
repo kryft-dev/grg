@@ -25,6 +25,14 @@ jobs:
           check-latest: true
           cache: true
 
+      - name: Verify module integrity
+        run: |
+          go mod verify
+
+      - name: Run test suite with race detector
+        run: |
+          go test -v -race -count=1 ./...
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
