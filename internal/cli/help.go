@@ -25,6 +25,7 @@ Common Flags:
     -m, --max-count NUM        Stop after NUM matches per blob
     -q, --quiet                Do not print matches; exit 0 if match found, 1 otherwise
     -a, --text                 Search binary files as text
+    -H, --heading              Print commit and path header above grouped matches
     -g, --glob GLOB            Include/exclude files matching glob (multi-value)
     -t, --type TYPE            Only search files of type TYPE (multi-value)
 
@@ -81,7 +82,7 @@ Output Formatting Flags:
     -m, --max-count NUM        Stop scanning a blob after NUM matching lines.
     -q, --quiet                Do not print matches to stdout. Exit 0 if match found, 1 otherwise.
         --color WHEN           Control terminal color: 'auto', 'always', or 'never' (default: auto).
-        --heading              Print commit and path header above grouped matches (default on TTY).
+    -H, --heading              Print commit and path header above grouped matches (default on TTY).
         --no-heading           Print matches inline in format <commit>:<path>:<line>:<text>.
 
 Filtering Flags:
@@ -120,5 +121,8 @@ Examples:
 
 // Version returns the version string.
 func Version() string {
+	if GitCommit != "" && GitCommit != "none" {
+		return fmt.Sprintf("grg %s (commit %s)", AppVersion, GitCommit)
+	}
 	return fmt.Sprintf("grg %s", AppVersion)
 }

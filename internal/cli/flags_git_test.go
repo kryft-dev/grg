@@ -135,7 +135,7 @@ func TestParseArgs_HelpAndVersion(t *testing.T) {
 	}
 
 	verStr := Version()
-	if !strings.Contains(verStr, "grg 0.1.0") {
+	if !strings.Contains(verStr, "grg "+AppVersion) {
 		t.Errorf("invalid version string: %s", verStr)
 	}
 }

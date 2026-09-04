@@ -9,7 +9,12 @@ import (
 )
 
 // AppVersion represents the current release version of grg.
-const AppVersion = "0.1.0"
+// It can be overridden at build time via ldflags.
+var AppVersion = "dev"
+
+// GitCommit represents the git commit SHA at build time.
+// It can be overridden at build time via ldflags.
+var GitCommit = "none"
 
 // Parse parses command line arguments (excluding the program name, e.g. os.Args[1:])
 // into a model.Config struct.
@@ -71,7 +76,7 @@ func ParseArgs(args []string) (*model.Config, error) {
 					i++
 					return v, nil
 				}
-				return "", fmt.Errorf("flag '--%s' requires an argument", name)
+				return "", fmt.Errorf("%w: flag '--%s' requires an argument", ErrInvalidArgument, name)
 			}
 
 			switch name {
@@ -220,7 +225,7 @@ func ParseArgs(args []string) (*model.Config, error) {
 				}
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return nil, fmt.Errorf("invalid context value '%s': must be a non-negative integer", v)
+					return nil, fmt.Errorf("%w: invalid context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.BeforeContext = n
 				cfg.AfterContext = n
@@ -231,7 +236,7 @@ func ParseArgs(args []string) (*model.Config, error) {
 				}
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return nil, fmt.Errorf("invalid after-context value '%s': must be a non-negative integer", v)
+					return nil, fmt.Errorf("%w: invalid after-context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.AfterContext = n
 			case "before-context":
@@ -241,7 +246,7 @@ func ParseArgs(args []string) (*model.Config, error) {
 				}
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return nil, fmt.Errorf("invalid before-context value '%s': must be a non-negative integer", v)
+					return nil, fmt.Errorf("%w: invalid before-context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.BeforeContext = n
 			case "max-count":
@@ -251,7 +256,7 @@ func ParseArgs(args []string) (*model.Config, error) {
 				}
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return nil, fmt.Errorf("invalid max-count value '%s': must be a non-negative integer", v)
+					return nil, fmt.Errorf("%w: invalid max-count value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.MaxCount = n
 			case "glob":
@@ -316,10 +321,10 @@ func ParseArgs(args []string) (*model.Config, error) {
 				case "auto", "always", "never", "ansi":
 					cfg.Color = model.ColorChoice(strings.ToLower(cVal))
 				default:
-					return nil, fmt.Errorf("invalid argument '%s' for '--color': must be one of 'auto', 'always', 'never'", cVal)
+					return nil, fmt.Errorf("%w: invalid argument '%s' for '--color': must be one of 'auto', 'always', 'never'", ErrInvalidArgument, cVal)
 				}
 			default:
-				return nil, fmt.Errorf("unknown flag: '--%s'", name)
+				return nil, fmt.Errorf("%w: unknown flag: '--%s'", ErrInvalidArgument, name)
 			}
 			i++
 			continue

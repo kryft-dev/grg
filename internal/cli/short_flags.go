@@ -3,11 +3,12 @@ package cli
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/kryft-dev/grg/internal/model"
 )
 
-// parseShortFlags processes a bundled short flag argument like -nv or -C2.
+// parseShortFlags processes a bundled short flag argument like -nv, -inC2, or -H.
 func parseShortFlags(arg string, args []string, i *int, cfg *model.Config) error {
 	rest := arg[1:]
 	for j := 0; j < len(rest); j++ {
@@ -50,6 +51,8 @@ func parseShortFlags(arg string, args []string, i *int, cfg *model.Config) error
 			cfg.Quiet = true
 		case 'a':
 			cfg.Text = true
+		case 'H':
+			cfg.Heading = true
 		case 'C', 'A', 'B', 'm', 'g', 't', 'e':
 			var v string
 			if j+1 < len(rest) {
@@ -57,35 +60,39 @@ func parseShortFlags(arg string, args []string, i *int, cfg *model.Config) error
 				j = len(rest) // consumed remainder of bundle
 			} else {
 				if *i+1 >= len(args) {
-					return fmt.Errorf("flag '-%c' requires an argument", ch)
+					return fmt.Errorf("%w: flag '-%c' requires an argument", ErrInvalidArgument, ch)
 				}
 				v = args[*i+1]
 				*i++
+			}
+			// Handle attached '=' for numeric arguments (e.g. -C=2 or -m=5)
+			if (ch == 'C' || ch == 'A' || ch == 'B' || ch == 'm') && strings.HasPrefix(v, "=") {
+				v = strings.TrimPrefix(v, "=")
 			}
 			switch ch {
 			case 'C':
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return fmt.Errorf("invalid context value '%s': must be a non-negative integer", v)
+					return fmt.Errorf("%w: invalid context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.BeforeContext = n
 				cfg.AfterContext = n
 			case 'A':
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return fmt.Errorf("invalid after-context value '%s': must be a non-negative integer", v)
+					return fmt.Errorf("%w: invalid after-context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.AfterContext = n
 			case 'B':
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return fmt.Errorf("invalid before-context value '%s': must be a non-negative integer", v)
+					return fmt.Errorf("%w: invalid before-context value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.BeforeContext = n
 			case 'm':
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 0 {
-					return fmt.Errorf("invalid max-count value '%s': must be a non-negative integer", v)
+					return fmt.Errorf("%w: invalid max-count value '%s': must be a non-negative integer", ErrInvalidArgument, v)
 				}
 				cfg.MaxCount = n
 			case 'g':
@@ -96,7 +103,7 @@ func parseShortFlags(arg string, args []string, i *int, cfg *model.Config) error
 				cfg.Patterns = append(cfg.Patterns, v)
 			}
 		default:
-			return fmt.Errorf("unknown flag: '-%c'", ch)
+			return fmt.Errorf("%w: unknown flag: '-%c'", ErrInvalidArgument, ch)
 		}
 	}
 	return nil

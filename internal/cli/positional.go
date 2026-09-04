@@ -23,7 +23,7 @@ func resolvePositionals(cfg *model.Config, positional []string, pathsAfterDouble
 		}
 	} else {
 		if len(positional) == 0 {
-			return fmt.Errorf("error: pattern is required\n\nUsage: grg [FLAGS] PATTERN [REV_RANGE] [-- PATHS...]\nTry 'grg --help' for more information.")
+			return fmt.Errorf("%w: error: pattern is required\n\nUsage: grg [FLAGS] PATTERN [REV_RANGE] [-- PATHS...]\nTry 'grg --help' for more information.", ErrInvalidArgument)
 		}
 		cfg.Pattern = positional[0]
 		cfg.Patterns = []string{positional[0]}
@@ -52,7 +52,7 @@ func parseBool(val string, hasVal bool) (bool, error) {
 	case "false", "0", "no", "off":
 		return false, nil
 	default:
-		return false, fmt.Errorf("invalid boolean value '%s'", val)
+		return false, fmt.Errorf("%w: invalid boolean value '%s'", ErrInvalidArgument, val)
 	}
 }
 

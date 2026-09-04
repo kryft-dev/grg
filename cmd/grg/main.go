@@ -1,11 +1,19 @@
+// Package main provides the command-line entry point for grg (Git Ripgrep).
+// It coordinates flag parsing, signal handling, repository discovery,
+// commit graph walking, parallel blob searching, match aggregation,
+// and terminal output rendering with ripgrep-compatible exit codes.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/kryft-dev/grg/internal/aggregator"
 	"github.com/kryft-dev/grg/internal/cli"
@@ -17,10 +25,15 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := runContext(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		ec := exitCodeForError(err)
 		if ec != 1 {
-			fmt.Fprintf(os.Stderr, "grg: %v\n", err)
+			if !isQuietError(err) {
+				fmt.Fprintf(os.Stderr, "grg: %v\n", err)
+			}
 		}
 		os.Exit(ec)
 	}
@@ -28,6 +41,10 @@ func main() {
 
 type exitCoder interface {
 	ExitCode() int
+}
+
+type quietChecker interface {
+	IsQuiet() bool
 }
 
 type repoError struct {
@@ -39,7 +56,11 @@ func (r repoError) Error() string {
 }
 
 func (r repoError) ExitCode() int {
-	return 128
+	return 2
+}
+
+func (r repoError) Unwrap() error {
+	return r.err
 }
 
 type cliError struct {
@@ -54,6 +75,34 @@ func (c cliError) ExitCode() int {
 	return 2
 }
 
+func (c cliError) Unwrap() error {
+	return c.err
+}
+
+type cancelError struct {
+	err   error
+	quiet bool
+}
+
+func (c cancelError) Error() string {
+	if c.err != nil {
+		return c.err.Error()
+	}
+	return "operation canceled"
+}
+
+func (c cancelError) ExitCode() int {
+	return 2
+}
+
+func (c cancelError) IsQuiet() bool {
+	return c.quiet
+}
+
+func (c cancelError) Unwrap() error {
+	return c.err
+}
+
 type noMatchError struct{}
 
 func (n noMatchError) Error() string {
@@ -64,24 +113,46 @@ func (n noMatchError) ExitCode() int {
 	return 1
 }
 
+func isQuietError(err error) bool {
+	var qc quietChecker
+	if errors.As(err, &qc) {
+		return qc.IsQuiet()
+	}
+	return false
+}
+
 func exitCodeForError(err error) int {
-	if ec, ok := err.(exitCoder); ok {
+	if err == nil {
+		return 0
+	}
+	var ec exitCoder
+	if errors.As(err, &ec) {
 		return ec.ExitCode()
 	}
-	if err != nil {
-		return 1
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 2
 	}
-	return 0
+	return 2
 }
 
 func run(args []string) error {
-	return runWithOutput(args, os.Stdout)
+	return runContext(context.Background(), args, os.Stdout, os.Stderr)
 }
 
 func runWithOutput(args []string, stdout io.Writer) error {
+	return runContext(context.Background(), args, stdout, os.Stderr)
+}
+
+func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	cfg, err := cli.Parse(args)
 	if err != nil {
 		return cliError{err: err}
+	}
+
+	quiet := cfg != nil && cfg.Quiet
+
+	if err := ctx.Err(); err != nil {
+		return cancelError{err: err, quiet: quiet}
 	}
 
 	if cfg.Help {
@@ -96,6 +167,14 @@ func runWithOutput(args []string, stdout io.Writer) error {
 	if cfg.Version {
 		fmt.Fprintln(stdout, cli.Version())
 		return nil
+	}
+
+	if err := cli.Validate(cfg); err != nil {
+		return cliError{err: err}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return cancelError{err: err, quiet: cfg.Quiet}
 	}
 
 	repo, err := gitengine.Discover()
@@ -114,7 +193,7 @@ func runWithOutput(args []string, stdout io.Writer) error {
 		return cliError{err: err}
 	}
 
-	pathFilter, err := buildPathFilter(cfg)
+	pathFilter, err := buildPathFilter(repo, cfg)
 	if err != nil {
 		return cliError{err: err}
 	}
@@ -123,11 +202,21 @@ func runWithOutput(args []string, stdout io.Writer) error {
 
 	var occurrences []model.BlobOccurrence
 	err = walker.Walk(func(occ model.BlobOccurrence) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		occurrences = append(occurrences, occ)
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return cancelError{err: err, quiet: cfg.Quiet}
+		}
 		return err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return cancelError{err: err, quiet: cfg.Quiet}
 	}
 
 	if len(occurrences) == 0 {
@@ -135,9 +224,44 @@ func runWithOutput(args []string, stdout io.Writer) error {
 	}
 
 	searchPipeline := search.NewPipeline(reader, matcher, cfg)
-	results, err := searchPipeline.Execute(occurrences)
+
+	type chanExecutor interface {
+		ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) (<-chan *search.BlobResult, <-chan error)
+	}
+	type sliceExecutor interface {
+		ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) ([]*search.BlobResult, error)
+	}
+
+	var results []*search.BlobResult
+	if che, ok := any(searchPipeline).(chanExecutor); ok {
+		resultsCh, errCh := che.ExecuteContext(ctx, occurrences)
+		for res := range resultsCh {
+			results = append(results, res)
+		}
+		if err = <-errCh; err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				return cancelError{err: err, quiet: cfg.Quiet}
+			}
+			return err
+		}
+	} else if se, ok := any(searchPipeline).(sliceExecutor); ok {
+		results, err = se.ExecuteContext(ctx, occurrences)
+	} else {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return cancelError{err: ctxErr, quiet: cfg.Quiet}
+		}
+		results, err = searchPipeline.Execute(occurrences)
+	}
+
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return cancelError{err: err, quiet: cfg.Quiet}
+		}
 		return err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return cancelError{err: err, quiet: cfg.Quiet}
 	}
 
 	if len(results) == 0 {
@@ -156,6 +280,10 @@ func runWithOutput(args []string, stdout io.Writer) error {
 		return noMatchError{}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return cancelError{err: err, quiet: cfg.Quiet}
+	}
+
 	formatter := output.NewFormatter(cfg)
 	if err := formatter.Format(stdout, aggregated); err != nil {
 		return err
@@ -164,7 +292,7 @@ func runWithOutput(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func buildPathFilter(cfg *model.Config) (func(path string) bool, error) {
+func buildPathFilter(repo *gitengine.RepoInfo, cfg *model.Config) (func(path string) bool, error) {
 	var gm *filter.GlobMatcher
 	if len(cfg.Globs) > 0 {
 		var err error
@@ -184,10 +312,21 @@ func buildPathFilter(cfg *model.Config) (func(path string) bool, error) {
 	}
 
 	var paths []string
+	cwd, cwdErr := os.Getwd()
 	for _, p := range cfg.Paths {
 		cleaned := filepath.ToSlash(filepath.Clean(p))
 		if cleaned == "." || cleaned == "" {
 			continue
+		}
+		// Anchor relative paths to repository worktree if run from subdirectory (SEC-03)
+		if cwdErr == nil && repo != nil && repo.WorkTree != "" && !filepath.IsAbs(p) {
+			absPath := filepath.Join(cwd, p)
+			if relToWorkTree, err := filepath.Rel(repo.WorkTree, absPath); err == nil && !strings.HasPrefix(relToWorkTree, "..") {
+				normRel := filepath.ToSlash(filepath.Clean(relToWorkTree))
+				if normRel != "." && normRel != "" {
+					paths = append(paths, normRel)
+				}
+			}
 		}
 		paths = append(paths, cleaned)
 	}
