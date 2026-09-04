@@ -136,7 +136,9 @@ func (p *Pipeline) processTask(task *blobTask) *BlobResult {
 
 	// Binary detection
 	if !p.cfg.Text && IsBinary(obj.Data) {
-		res.IsBinary = true
+		if p.matcher.MatchBytes(obj.Data) {
+			res.IsBinary = true
+		}
 		return res
 	}
 

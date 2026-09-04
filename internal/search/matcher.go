@@ -82,6 +82,14 @@ func NewMatcher(cfg *model.Config) (*Matcher, error) {
 	}, nil
 }
 
+// MatchBytes reports whether the search pattern matches anywhere in data.
+func (m *Matcher) MatchBytes(data []byte) bool {
+	if m.cfg.InvertMatch {
+		return !m.re.Match(data)
+	}
+	return m.re.Match(data)
+}
+
 // MatchBlob searches data line-by-line and returns matching lines.
 func (m *Matcher) MatchBlob(data []byte) ([]model.SearchMatch, error) {
 	lines := splitLines(data)

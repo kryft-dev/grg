@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 var (
@@ -126,4 +127,52 @@ func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, callback fu
 	}
 
 	return nil
+}
+
+// FindTreeEntry searches rootOID for the tree entry at path (slash-separated).
+// Returns the entry and true if found, or a zero TreeEntry and false if not found.
+func FindTreeEntry(reader ObjectReader, rootOID, path string) (TreeEntry, bool) {
+	if rootOID == "" || path == "" {
+		return TreeEntry{}, false
+	}
+
+	parts := strings.Split(path, "/")
+	currOID := rootOID
+
+	for i, part := range parts {
+		obj, err := reader.ReadObject(currOID)
+		if err != nil || obj.Type != TypeTree {
+			return TreeEntry{}, false
+		}
+
+		entries, err := ParseTree(obj.Data)
+		if err != nil {
+			return TreeEntry{}, false
+		}
+
+		found := false
+		var matchedEntry TreeEntry
+		for _, e := range entries {
+			if e.Name == part {
+				matchedEntry = e
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return TreeEntry{}, false
+		}
+
+		if i == len(parts)-1 {
+			return matchedEntry, true
+		}
+
+		if !matchedEntry.IsTree() {
+			return TreeEntry{}, false
+		}
+		currOID = matchedEntry.OID
+	}
+
+	return TreeEntry{}, false
 }

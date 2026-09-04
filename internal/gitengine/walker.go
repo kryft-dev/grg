@@ -152,6 +152,24 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 				continue
 			}
 
+			// In full DAG traversal, a merge commit does not introduce a blob
+			// if that blob was already present in another parent branch.
+			if len(commit.Parents) > 1 && !w.cfg.FirstParent {
+				inOtherParent := false
+				for _, pSHA := range commit.Parents[1:] {
+					pMeta := w.readCommit(pSHA)
+					if pMeta != nil {
+						if pe, ok := FindTreeEntry(w.reader, pMeta.TreeOID, entryPath); ok && pe.OID == newEntry.OID {
+							inOtherParent = true
+							break
+						}
+					}
+				}
+				if inOtherParent {
+					continue
+				}
+			}
+
 			key := newEntry.OID + ":" + entryPath
 			if !w.cfg.ExpandCommits {
 				if seenBlobOcc[key] {
