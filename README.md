@@ -41,8 +41,8 @@ Ensure Go 1.22 or newer is installed:
 git clone https://github.com/kryft-dev/grg.git
 cd grg
 
-# Build the standalone binary
-go build -ldflags="-s -w" -o grg ./cmd/grg
+# Build the standalone binary (with version and commit injection)
+go build -ldflags="-s -w -X github.com/kryft-dev/grg/internal/cli.AppVersion=0.1.0 -X github.com/kryft-dev/grg/internal/cli.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo 'none')" -o grg ./cmd/grg
 
 # Verify installation
 ./grg --version
@@ -321,6 +321,15 @@ End-to-end repository searches across packed synthetic repositories:
    - Maps search matches back to their historical occurrences.
    - Collapses unchanged blobs to their introducing commit (unless `--expand-commits` is set).
    - Sorts results chronologically (newest commits first) and formats output with ANSI color highlights, file headers, line numbers, or single-line `--no-heading` records.
+
+---
+
+## Quality & Security Assurance
+
+The `grg` codebase enforces stringent quality gates across all packages:
+- **Production Static Analysis**: Validated against comprehensive `.golangci.yml` linters (`errcheck`, `staticcheck`, `gosec`, `nilerr`, `unused`, `unconvert`, `ineffassign`, `misspell`).
+- **Race Condition Detection**: Every PR and CI run verifies data race safety using `go test -race ./...`.
+- **Vulnerability Auditing**: Automated continuous scanning with `govulncheck` to ensure 0 known CVEs.
 
 ---
 

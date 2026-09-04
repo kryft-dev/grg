@@ -43,10 +43,19 @@ go test -v -count=1 ./...
 go test -race -count=1 ./...
 ```
 
-### Running Static Analysis
+### Running Static Analysis & Linters
 ```bash
 # Run Go vet
 go vet ./...
+
+# Run production-grade linters configured in .golangci.yml
+golangci-lint run ./...
+
+# Verify module dependency integrity and checksums
+go mod verify
+
+# Scan for known vulnerabilities in dependencies
+govulncheck ./...
 
 # Ensure code is properly formatted
 test -z "$(gofmt -l .)"
@@ -111,6 +120,9 @@ To maintain code health and reliability, please adhere to the following standard
    - `refactor: ...` for code refactoring without behavior changes.
 4. **Self-Review**:
    - Run `go vet ./...`
+   - Run `golangci-lint run ./...`
+   - Run `go mod verify`
+   - Run `govulncheck ./...`
    - Run `go test -race -count=1 ./...`
    - Ensure new functionality has accompanying tests.
 5. **Open a Pull Request**: Submit your pull request against the `main` branch. Fill out the pull request template completely.
