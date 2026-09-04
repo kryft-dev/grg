@@ -29,7 +29,18 @@ type BlobOccurrence struct {
 	Path       string    // Repository-relative file path
 	CommitSHA  string    // Commit where this blob was introduced or observed
 	CommitDate time.Time // Commit timestamp
-	Mode       uint32    // Git file mode (e.g. 0100644, 0100755)
+	Mode          uint32          // Git file mode (e.g. 0100644, 0100755)
+	CommitSummary string          // First line of commit message
+	CommitAuthor  string          // Commit author name or string
+	Commit        *CommitMetadata // Associated commit metadata, if available
+}
+
+// ShortSHA returns the canonical 7-character Git short hash.
+func ShortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // Submatch represents the byte offset bounds of a match within a line.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kryft-dev/grg/internal/gitengine"
 	"github.com/kryft-dev/grg/internal/model"
@@ -79,13 +80,20 @@ func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, e
 	close(tasksCh)
 
 	// Launch worker pool
+	var stop atomic.Bool
 	var wg sync.WaitGroup
 	for i := 0; i < p.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for task := range tasksCh {
+				if stop.Load() {
+					continue
+				}
 				res := p.processTask(task)
+				if p.cfg.Quiet && (len(res.Matches) > 0 || res.IsBinary) {
+					stop.Store(true)
+				}
 				resultsCh <- res
 			}
 		}()

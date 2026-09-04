@@ -80,12 +80,19 @@ func (w *HistoryWalker) walkCommitBlobs(commit *model.CommitMetadata, seenBlobOc
 			seenBlobOcc[key] = true
 		}
 
+		author := commit.AuthorName
+		if author == "" {
+			author = commit.Author
+		}
 		return fn(model.BlobOccurrence{
-			BlobOID:    entry.OID,
-			Path:       path,
-			CommitSHA:  commit.SHA,
-			CommitDate: commit.Date,
-			Mode:       entry.Mode,
+			BlobOID:       entry.OID,
+			Path:          path,
+			CommitSHA:     commit.SHA,
+			CommitDate:    commit.Date,
+			Mode:          entry.Mode,
+			CommitSummary: commit.Summary,
+			CommitAuthor:  author,
+			Commit:        commit,
 		})
 	})
 }
@@ -153,12 +160,19 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 				seenBlobOcc[key] = true
 			}
 
+			author := commit.AuthorName
+			if author == "" {
+				author = commit.Author
+			}
 			if err := fn(model.BlobOccurrence{
-				BlobOID:    newEntry.OID,
-				Path:       entryPath,
-				CommitSHA:  commit.SHA,
-				CommitDate: commit.Date,
-				Mode:       newEntry.Mode,
+				BlobOID:       newEntry.OID,
+				Path:          entryPath,
+				CommitSHA:     commit.SHA,
+				CommitDate:    commit.Date,
+				Mode:          newEntry.Mode,
+				CommitSummary: commit.Summary,
+				CommitAuthor:  author,
+				Commit:        commit,
 			}); err != nil {
 				return err
 			}
