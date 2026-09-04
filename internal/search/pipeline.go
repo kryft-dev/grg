@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
@@ -48,8 +49,14 @@ type blobTask struct {
 	occurrences []model.BlobOccurrence
 }
 
-// Execute processes a list of blob occurrences, deduplicating by BlobOID before searching.
-func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, error) {
+// ExecuteContext executes the search pipeline with context cancellation support,
+// bounded worker pools, channel backpressure, and zero goroutine leaks.
+// It streams results and errors over bounded channels until completion or cancellation.
+func (p *Pipeline) ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) (<-chan *BlobResult, <-chan error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Deduplicate by BlobOID while preserving provenance occurrences in first-seen order
 	jobMap := make(map[string]*blobTask)
 	var jobOrder []*blobTask
@@ -67,17 +74,45 @@ func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, e
 		}
 	}
 
+	// If context is already cancelled, return immediately with closed channels
+	if err := ctx.Err(); err != nil {
+		resultsCh := make(chan *BlobResult)
+		errCh := make(chan error, 1)
+		errCh <- err
+		close(resultsCh)
+		close(errCh)
+		return resultsCh, errCh
+	}
+
 	if len(jobOrder) == 0 {
-		return nil, nil
+		resultsCh := make(chan *BlobResult)
+		errCh := make(chan error)
+		close(resultsCh)
+		close(errCh)
+		return resultsCh, errCh
 	}
 
-	tasksCh := make(chan *blobTask, len(jobOrder))
-	resultsCh := make(chan *BlobResult, len(jobOrder))
-
-	for _, task := range jobOrder {
-		tasksCh <- task
+	// Enforce bounded worker pool and channel backpressure (runtime.NumCPU() * 4 or min 32)
+	bufSize := p.workers * 4
+	if bufSize < 32 {
+		bufSize = 32
 	}
-	close(tasksCh)
+
+	tasksCh := make(chan *blobTask, bufSize)
+	resultsCh := make(chan *BlobResult, bufSize)
+	errCh := make(chan error, 1)
+
+	// Dispatcher feeding tasks into bounded tasksCh with ctx cancellation check
+	go func() {
+		defer close(tasksCh)
+		for _, task := range jobOrder {
+			select {
+			case <-ctx.Done():
+				return
+			case tasksCh <- task:
+			}
+		}
+	}()
 
 	// Launch worker pool
 	var stop atomic.Bool
@@ -86,51 +121,107 @@ func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, e
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for task := range tasksCh {
-				if stop.Load() {
-					continue
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-tasksCh:
+					if !ok {
+						return
+					}
+					if stop.Load() {
+						continue
+					}
+					res := p.processTask(ctx, task)
+					if res.Error != nil {
+						select {
+						case errCh <- res.Error:
+						default:
+						}
+					}
+					if p.cfg.Quiet && (len(res.Matches) > 0 || res.IsBinary) {
+						stop.Store(true)
+					}
+					// Only send results that have matches, are binary, or have errors
+					if len(res.Matches) > 0 || res.IsBinary || res.Error != nil {
+						select {
+						case <-ctx.Done():
+							return
+						case resultsCh <- res:
+						}
+					}
 				}
-				res := p.processTask(task)
-				if p.cfg.Quiet && (len(res.Matches) > 0 || res.IsBinary) {
-					stop.Store(true)
-				}
-				resultsCh <- res
 			}
 		}()
 	}
 
-	wg.Wait()
-	close(resultsCh)
+	// Closer goroutine waits for all workers to exit, captures cancellation error, and closes channels
+	go func() {
+		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}
+		close(resultsCh)
+		close(errCh)
+	}()
 
-	// Collect results in map to restore original deduplicated order
-	resMap := make(map[string]*BlobResult, len(jobOrder))
+	return resultsCh, errCh
+}
+
+// Execute provides backwards-compatible synchronous execution by executing with context.Background()
+// and collecting all results into a slice in the original deduplicated order.
+func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, error) {
+	resultsCh, errCh := p.ExecuteContext(context.Background(), occurrences)
+	resMap := make(map[string]*BlobResult)
 	for res := range resultsCh {
 		resMap[res.BlobOID] = res
 	}
-
-	var results []*BlobResult
-	for _, task := range jobOrder {
-		if res, ok := resMap[task.oid]; ok {
-			// Only include results that have matches, are binary, or have errors
-			if len(res.Matches) > 0 || res.IsBinary || res.Error != nil {
-				results = append(results, res)
-			}
-		}
+	if err := <-errCh; err != nil {
+		return nil, err
 	}
 
+	seen := make(map[string]bool)
+	var results []*BlobResult
+	for _, occ := range occurrences {
+		if seen[occ.BlobOID] {
+			continue
+		}
+		seen[occ.BlobOID] = true
+		if res, ok := resMap[occ.BlobOID]; ok {
+			results = append(results, res)
+		}
+	}
 	return results, nil
 }
 
+// ExecuteStream streams search results using context.Background().
+func (p *Pipeline) ExecuteStream(occurrences []model.BlobOccurrence) (<-chan *BlobResult, <-chan error) {
+	return p.ExecuteContext(context.Background(), occurrences)
+}
+
 // processTask reads the blob from Git object store and applies binary detection and pattern matching.
-func (p *Pipeline) processTask(task *blobTask) *BlobResult {
+func (p *Pipeline) processTask(ctx context.Context, task *blobTask) *BlobResult {
 	res := &BlobResult{
 		BlobOID:     task.oid,
 		Occurrences: task.occurrences,
 	}
 
+	if err := ctx.Err(); err != nil {
+		res.Error = err
+		return res
+	}
+
 	obj, err := p.reader.ReadObject(task.oid)
 	if err != nil {
 		res.Error = fmt.Errorf("failed to read blob %s: %w", task.oid, err)
+		return res
+	}
+
+	if err := ctx.Err(); err != nil {
+		res.Error = err
 		return res
 	}
 

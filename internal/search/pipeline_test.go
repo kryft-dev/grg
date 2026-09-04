@@ -1,9 +1,11 @@
 package search
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -174,3 +176,202 @@ func TestPipelineWithContext(t *testing.T) {
 		t.Errorf("wrong context line numbers: %+v", group.Lines)
 	}
 }
+
+func TestPipelineExecuteContext_Streaming(t *testing.T) {
+	reader := newMockSearchReader()
+	blob1 := reader.putBlob([]byte("target match in blob 1\n"))
+	blob2 := reader.putBlob([]byte("target match in blob 2\n"))
+	blob3 := reader.putBlob([]byte("non-matching content\n"))
+
+	occurrences := []model.BlobOccurrence{
+		{BlobOID: blob1, Path: "f1.txt", CommitSHA: "c1", Mode: 0100644},
+		{BlobOID: blob2, Path: "f2.txt", CommitSHA: "c2", Mode: 0100644},
+		{BlobOID: blob3, Path: "f3.txt", CommitSHA: "c3", Mode: 0100644},
+	}
+
+	cfg := &model.Config{Pattern: "target"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+
+	pipeline := NewPipeline(reader, matcher, cfg)
+	resultsCh, errCh := pipeline.ExecuteContext(context.Background(), occurrences)
+
+	var streamResults []*BlobResult
+	for res := range resultsCh {
+		streamResults = append(streamResults, res)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected pipeline error: %v", err)
+	}
+
+	if len(streamResults) != 2 {
+		t.Fatalf("expected 2 matching results from stream, got %d", len(streamResults))
+	}
+}
+
+func TestPipelineExecuteContext_CancelledContext(t *testing.T) {
+	reader := newMockSearchReader()
+	var occurrences []model.BlobOccurrence
+	for i := 0; i < 200; i++ {
+		oid := reader.putBlob([]byte(fmt.Sprintf("line %d with needle in blob\n", i)))
+		occurrences = append(occurrences, model.BlobOccurrence{
+			BlobOID:   oid,
+			Path:      fmt.Sprintf("file_%d.txt", i),
+			CommitSHA: "c1",
+			Mode:      0100644,
+		})
+	}
+
+	cfg := &model.Config{Pattern: "needle"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pipeline := NewPipeline(reader, matcher, cfg)
+	resultsCh, errCh := pipeline.ExecuteContext(ctx, occurrences)
+
+	// Read one result, then cancel context immediately
+	<-resultsCh
+	cancel()
+
+	// Drain remaining results to ensure pipeline shuts down cleanly without deadlocking
+	count := 1
+	for range resultsCh {
+		count++
+	}
+
+	err = <-errCh
+	if err == nil && count < len(occurrences) {
+		// Context was cancelled mid-flight
+		t.Logf("Pipeline stopped after reading %d of %d items", count, len(occurrences))
+	}
+}
+
+func TestPipelineExecuteContext_ZeroGoroutineLeak(t *testing.T) {
+	reader := newMockSearchReader()
+	var occurrences []model.BlobOccurrence
+	for i := 0; i < 300; i++ {
+		oid := reader.putBlob([]byte(fmt.Sprintf("content with search_key for item %d\n", i)))
+		occurrences = append(occurrences, model.BlobOccurrence{
+			BlobOID:   oid,
+			Path:      fmt.Sprintf("path/file_%d.txt", i),
+			CommitSHA: "c1",
+			Mode:      0100644,
+		})
+	}
+
+	cfg := &model.Config{Pattern: "search_key"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+
+	// Give runtime a chance to stabilize
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	baseGoroutines := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pipeline := NewPipeline(reader, matcher, cfg)
+	resultsCh, errCh := pipeline.ExecuteContext(ctx, occurrences)
+
+	// Cancel after reading a few results
+	for i := 0; i < 5; i++ {
+		<-resultsCh
+	}
+	cancel()
+
+	// Drain results and errors
+	for range resultsCh {
+	}
+	<-errCh
+
+	// Verify all workers, dispatchers, and closers exit
+	var finalGoroutines int
+	for attempt := 0; attempt < 50; attempt++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+		finalGoroutines = runtime.NumGoroutine()
+		if finalGoroutines <= baseGoroutines+1 {
+			break
+		}
+	}
+
+	if finalGoroutines > baseGoroutines+2 {
+		t.Errorf("goroutine leak detected: baseline=%d, final=%d", baseGoroutines, finalGoroutines)
+	}
+}
+
+func TestPipelineExecuteContext_EarlyCancelled(t *testing.T) {
+	reader := newMockSearchReader()
+	oid := reader.putBlob([]byte("data"))
+	occurrences := []model.BlobOccurrence{{BlobOID: oid, Path: "file.txt"}}
+
+	cfg := &model.Config{Pattern: "data"}
+	matcher, _ := NewMatcher(cfg)
+	pipeline := NewPipeline(reader, matcher, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before starting
+
+	resultsCh, errCh := pipeline.ExecuteContext(ctx, occurrences)
+	for range resultsCh {
+		t.Errorf("expected no results from early-cancelled pipeline")
+	}
+
+	err := <-errCh
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestPipelineExecuteContext_Empty(t *testing.T) {
+	reader := newMockSearchReader()
+	cfg := &model.Config{Pattern: "pattern"}
+	matcher, _ := NewMatcher(cfg)
+	pipeline := NewPipeline(reader, matcher, cfg)
+
+	resultsCh, errCh := pipeline.ExecuteContext(context.Background(), nil)
+	for range resultsCh {
+		t.Errorf("expected no results for empty occurrences")
+	}
+	err, ok := <-errCh
+	if ok && err != nil {
+		t.Errorf("expected no error for empty occurrences, got %v", err)
+	}
+}
+
+func TestPipelineExecuteContext_ReaderError(t *testing.T) {
+	reader := newMockSearchReader() // missing blob
+	occurrences := []model.BlobOccurrence{
+		{BlobOID: "nonexistent_oid", Path: "missing.txt", CommitSHA: "c1", Mode: 0100644},
+	}
+
+	cfg := &model.Config{Pattern: "pattern"}
+	matcher, _ := NewMatcher(cfg)
+	pipeline := NewPipeline(reader, matcher, cfg)
+
+	resultsCh, errCh := pipeline.ExecuteContext(context.Background(), occurrences)
+	var results []*BlobResult
+	for res := range resultsCh {
+		results = append(results, res)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result with error, got %d", len(results))
+	}
+	if results[0].Error == nil {
+		t.Errorf("expected blob reading error on result")
+	}
+
+	err := <-errCh
+	if err == nil {
+		t.Errorf("expected error propagated to errCh")
+	}
+}
+

@@ -125,3 +125,30 @@ func TestMatcherInvertAndMaxCount(t *testing.T) {
 		t.Errorf("expected max 2 matches, got %d", len(matchesMax))
 	}
 }
+
+func TestMatcher_MatchBlob_ShortCircuit(t *testing.T) {
+	text := []byte("alpha\nbeta\ngamma\ndelta\n")
+	cfg := &model.Config{
+		Pattern: "nonexistent_pattern",
+	}
+	m, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+
+	matches, err := m.MatchBlob(text)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if matches != nil {
+		t.Errorf("expected nil matches for non-matching blob, got %v", matches)
+	}
+
+	// Verify zero allocations on non-matching blobs (tolerating race detector overhead)
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = m.MatchBlob(text)
+	})
+	if allocs > 1 {
+		t.Errorf("expected at most 1 allocation (0 in non-race mode) on short-circuit path, got %v", allocs)
+	}
+}

@@ -66,9 +66,11 @@ func NewMatcher(cfg *model.Config) (*Matcher, error) {
 	}
 
 	combinedPattern := strings.Join(parts, "|")
+	flags := "(?m)"
 	if !caseSensitive {
-		combinedPattern = "(?i)" + combinedPattern
+		flags += "(?i)"
 	}
+	combinedPattern = flags + combinedPattern
 
 	re, err := regexp.Compile(combinedPattern)
 	if err != nil {
@@ -92,6 +94,10 @@ func (m *Matcher) MatchBytes(data []byte) bool {
 
 // MatchBlob searches data line-by-line and returns matching lines.
 func (m *Matcher) MatchBlob(data []byte) ([]model.SearchMatch, error) {
+	// Fast path: short-circuit non-matching blobs before splitting lines into heap strings.
+	if !m.cfg.InvertMatch && !m.MatchBytes(data) {
+		return nil, nil
+	}
 	lines := splitLines(data)
 	return m.MatchLines(lines), nil
 }
@@ -143,6 +149,10 @@ func (m *Matcher) MatchLines(lines []string) []model.SearchMatch {
 
 // MatchBlobWithContext searches data and extracts context groups according to -A, -B, -C.
 func (m *Matcher) MatchBlobWithContext(data []byte) ([]ContextGroup, []string, error) {
+	// Fast path: short-circuit non-matching blobs before splitting lines into heap strings.
+	if !m.cfg.InvertMatch && !m.MatchBytes(data) {
+		return nil, nil, nil
+	}
 	lines := splitLines(data)
 	matches := m.MatchLines(lines)
 	if len(matches) == 0 {

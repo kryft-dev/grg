@@ -1,6 +1,8 @@
 package aggregator
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -169,3 +171,138 @@ func TestAggregator_BinaryResults(t *testing.T) {
 		t.Errorf("expected 1 file with binary commit")
 	}
 }
+
+func TestAggregator_DefensiveCopy(t *testing.T) {
+	submatches := []model.Submatch{{Start: 0, End: 4}}
+	matches := []model.SearchMatch{
+		{LineNum: 1, LineText: "test line", Submatches: submatches},
+	}
+	res := &search.BlobResult{
+		BlobOID: "blob1",
+		Matches: matches,
+		Occurrences: []model.BlobOccurrence{
+			{Path: "main.go", CommitSHA: "c1", CommitDate: time.Now()},
+		},
+	}
+
+	agg := New(&model.Config{})
+	out := agg.Aggregate([]*search.BlobResult{res})
+
+	if len(out.Files) != 1 || len(out.Files[0].Commits) != 1 {
+		t.Fatalf("expected 1 file and 1 commit")
+	}
+
+	// Mutate original slice
+	matches[0].LineText = "MUTATED"
+	submatches[0].Start = 999
+
+	// Verify aggregated matches were defensively copied and remain unaffected
+	aggregatedMatch := out.Files[0].Commits[0].Matches[0]
+	if aggregatedMatch.LineText != "test line" {
+		t.Errorf("defensive copy failed: expected 'test line', got %q", aggregatedMatch.LineText)
+	}
+	if aggregatedMatch.Submatches[0].Start != 0 {
+		t.Errorf("defensive submatches copy failed: expected 0, got %d", aggregatedMatch.Submatches[0].Start)
+	}
+}
+
+func TestAggregator_AggregateChannel_Success(t *testing.T) {
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+
+	res1 := &search.BlobResult{
+		BlobOID: "blob1",
+		Matches: []model.SearchMatch{{LineNum: 10, LineText: "func Hello()"}},
+		Occurrences: []model.BlobOccurrence{
+			{Path: "hello.go", CommitSHA: "c1", CommitDate: t1},
+		},
+	}
+	res2 := &search.BlobResult{
+		BlobOID: "blob2",
+		Matches: []model.SearchMatch{{LineNum: 20, LineText: "func World()"}},
+		Occurrences: []model.BlobOccurrence{
+			{Path: "world.go", CommitSHA: "c2", CommitDate: t2},
+		},
+	}
+
+	agg := New(&model.Config{})
+
+	// Compare channel results with slice Aggregate results
+	expected := agg.Aggregate([]*search.BlobResult{res1, res2})
+
+	resultsCh := make(chan *search.BlobResult, 2)
+	errCh := make(chan error, 1)
+
+	resultsCh <- res1
+	resultsCh <- res2
+	close(resultsCh)
+
+	actual, err := agg.AggregateChannel(context.Background(), resultsCh, errCh)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if actual.TotalMatches != expected.TotalMatches {
+		t.Errorf("expected %d total matches, got %d", expected.TotalMatches, actual.TotalMatches)
+	}
+	if len(actual.Files) != len(expected.Files) {
+		t.Fatalf("expected %d files, got %d", len(expected.Files), len(actual.Files))
+	}
+	for i := range actual.Files {
+		if actual.Files[i].Path != expected.Files[i].Path {
+			t.Errorf("file %d path mismatch: expected %s, got %s", i, expected.Files[i].Path, actual.Files[i].Path)
+		}
+	}
+}
+
+func TestAggregator_AggregateChannel_Cancellation(t *testing.T) {
+	agg := New(&model.Config{})
+	resultsCh := make(chan *search.BlobResult)
+	errCh := make(chan error)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	out, err := agg.AggregateChannel(ctx, resultsCh, errCh)
+	if out != nil {
+		t.Errorf("expected nil results on cancelled context")
+	}
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestAggregator_AggregateChannel_Error(t *testing.T) {
+	agg := New(&model.Config{})
+	resultsCh := make(chan *search.BlobResult, 1)
+	errCh := make(chan error, 1)
+
+	expectedErr := errors.New("pipeline failed")
+	errCh <- expectedErr
+
+	out, err := agg.AggregateChannel(context.Background(), resultsCh, errCh)
+	if out != nil {
+		t.Errorf("expected nil results on error")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected %v, got %v", expectedErr, err)
+	}
+}
+
+func TestAggregator_AggregateChannel_BlobError(t *testing.T) {
+	agg := New(&model.Config{})
+	resultsCh := make(chan *search.BlobResult, 1)
+	errCh := make(chan error)
+
+	blobErr := errors.New("blob decompression error")
+	resultsCh <- &search.BlobResult{Error: blobErr}
+
+	out, err := agg.AggregateChannel(context.Background(), resultsCh, errCh)
+	if out != nil {
+		t.Errorf("expected nil results on blob error")
+	}
+	if !errors.Is(err, blobErr) {
+		t.Errorf("expected %v, got %v", blobErr, err)
+	}
+}
+

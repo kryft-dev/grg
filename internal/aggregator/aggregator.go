@@ -1,6 +1,7 @@
 package aggregator
 
 import (
+	"context"
 	"sort"
 	"time"
 
@@ -78,55 +79,143 @@ func (a *Aggregator) Aggregate(results []*search.BlobResult) *AggregatedResults 
 	fileMap := make(map[string]*fileBuilder)
 
 	for _, res := range results {
-		if len(res.Matches) == 0 && !res.IsBinary {
+		if res == nil {
 			continue
 		}
+		a.processBlobResult(res, fileMap, &fileOrder)
+	}
 
-		occurrences := a.selectOccurrences(res.Occurrences)
+	return a.finalizeResults(fileMap, fileOrder)
+}
 
-		for _, occ := range occurrences {
-			fb, exists := fileMap[occ.Path]
-			if !exists {
-				fb = &fileBuilder{
-					path:      occ.Path,
-					commitMap: make(map[string]*CommitMatches),
-				}
-				fileMap[occ.Path] = fb
-				fileOrder = append(fileOrder, occ.Path)
+// AggregateChannel organizes streamed BlobResult items into structured, ordered FileMatches.
+// It terminates cleanly when resultsCh is closed, an error is received on errCh, or ctx is cancelled.
+func (a *Aggregator) AggregateChannel(ctx context.Context, resultsCh <-chan *search.BlobResult, errCh <-chan error) (*AggregatedResults, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var fileOrder []string
+	fileMap := make(map[string]*fileBuilder)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case err, ok := <-errCh:
+			if ok && err != nil {
+				return nil, err
 			}
-
-			cm, hasCommit := fb.commitMap[occ.CommitSHA]
-			if !hasCommit {
-				author := occ.CommitAuthor
-				if author == "" && occ.Commit != nil {
-					if occ.Commit.AuthorName != "" {
-						author = occ.Commit.AuthorName
-					} else {
-						author = occ.Commit.Author
+		case res, ok := <-resultsCh:
+			if !ok {
+				// Channel closed: verify if any pending error remains on errCh
+				if errCh != nil {
+					select {
+					case err, ok := <-errCh:
+						if ok && err != nil {
+							return nil, err
+						}
+					default:
 					}
 				}
-				summary := occ.CommitSummary
-				if summary == "" && occ.Commit != nil {
-					summary = occ.Commit.Summary
+				return a.finalizeResults(fileMap, fileOrder), nil
+			}
+			if res != nil {
+				if res.Error != nil {
+					return nil, res.Error
 				}
-
-				cm = &CommitMatches{
-					CommitSHA:     occ.CommitSHA,
-					ShortSHA:      model.ShortSHA(occ.CommitSHA),
-					CommitDate:    occ.CommitDate,
-					Author:        author,
-					AuthorName:    author,
-					Summary:       summary,
-					Matches:       res.Matches,
-					ContextGroups: res.ContextGroups,
-					IsBinary:      res.IsBinary,
-				}
-				fb.commitMap[occ.CommitSHA] = cm
-				fb.commitOrder = append(fb.commitOrder, occ.CommitSHA)
+				a.processBlobResult(res, fileMap, &fileOrder)
 			}
 		}
 	}
+}
 
+// AggregateStream is an alias to AggregateChannel for streaming API flexibility.
+func (a *Aggregator) AggregateStream(ctx context.Context, resultsCh <-chan *search.BlobResult, errCh <-chan error) (*AggregatedResults, error) {
+	return a.AggregateChannel(ctx, resultsCh, errCh)
+}
+
+func (a *Aggregator) processBlobResult(res *search.BlobResult, fileMap map[string]*fileBuilder, fileOrder *[]string) {
+	if len(res.Matches) == 0 && !res.IsBinary {
+		return
+	}
+
+	occurrences := a.selectOccurrences(res.Occurrences)
+
+	for _, occ := range occurrences {
+		fb, exists := fileMap[occ.Path]
+		if !exists {
+			fb = &fileBuilder{
+				path:      occ.Path,
+				commitMap: make(map[string]*CommitMatches),
+			}
+			fileMap[occ.Path] = fb
+			*fileOrder = append(*fileOrder, occ.Path)
+		}
+
+		_, hasCommit := fb.commitMap[occ.CommitSHA]
+		if !hasCommit {
+			author := occ.CommitAuthor
+			if author == "" && occ.Commit != nil {
+				if occ.Commit.AuthorName != "" {
+					author = occ.Commit.AuthorName
+				} else {
+					author = occ.Commit.Author
+				}
+			}
+			summary := occ.CommitSummary
+			if summary == "" && occ.Commit != nil {
+				summary = occ.Commit.Summary
+			}
+
+			// Defensively copy Matches to prevent slice aliasing across commits/goroutines
+			var copiedMatches []model.SearchMatch
+			if len(res.Matches) > 0 {
+				copiedMatches = make([]model.SearchMatch, len(res.Matches))
+				for i, m := range res.Matches {
+					copiedMatches[i] = m
+					if len(m.Submatches) > 0 {
+						copiedMatches[i].Submatches = append([]model.Submatch(nil), m.Submatches...)
+					}
+				}
+			}
+
+			// Defensively copy ContextGroups
+			var copiedContextGroups []search.ContextGroup
+			if len(res.ContextGroups) > 0 {
+				copiedContextGroups = make([]search.ContextGroup, len(res.ContextGroups))
+				for i, cg := range res.ContextGroups {
+					copiedContextGroups[i] = cg
+					if len(cg.Lines) > 0 {
+						copiedContextGroups[i].Lines = make([]search.ContextLine, len(cg.Lines))
+						for j, cl := range cg.Lines {
+							copiedContextGroups[i].Lines[j] = cl
+							if len(cl.Submatches) > 0 {
+								copiedContextGroups[i].Lines[j].Submatches = append([]model.Submatch(nil), cl.Submatches...)
+							}
+						}
+					}
+				}
+			}
+
+			cm := &CommitMatches{
+				CommitSHA:     occ.CommitSHA,
+				ShortSHA:      model.ShortSHA(occ.CommitSHA),
+				CommitDate:    occ.CommitDate,
+				Author:        author,
+				AuthorName:    author,
+				Summary:       summary,
+				Matches:       copiedMatches,
+				ContextGroups: copiedContextGroups,
+				IsBinary:      res.IsBinary,
+			}
+			fb.commitMap[occ.CommitSHA] = cm
+			fb.commitOrder = append(fb.commitOrder, occ.CommitSHA)
+		}
+	}
+}
+
+func (a *Aggregator) finalizeResults(fileMap map[string]*fileBuilder, fileOrder []string) *AggregatedResults {
 	var files []FileMatches
 	for _, path := range fileOrder {
 		fb := fileMap[path]
