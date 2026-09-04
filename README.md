@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/kryft-dev/grg.svg)](https://pkg.go.dev/github.com/kryft-dev/grg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
+[![CI](https://github.com/kryft-dev/grg/actions/workflows/ci.yaml/badge.svg)](https://github.com/kryft-dev/grg/actions/workflows/ci.yaml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kryft-dev/grg)](https://goreportcard.com/report/github.com/kryft-dev/grg)
 
 `grg` is a lightning-fast, standalone command-line search tool that brings **ripgrep** semantics directly to **Git repository history**.
@@ -321,6 +321,12 @@ End-to-end repository searches across packed synthetic repositories:
    - Maps search matches back to their historical occurrences.
    - Collapses unchanged blobs to their introducing commit (unless `--expand-commits` is set).
    - Sorts results chronologically (newest commits first) and formats output with ANSI color highlights, file headers, line numbers, or single-line `--no-heading` records.
+
+---
+
+## Contributing
+
+Contributions, bug reports, and feature suggestions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on development setup, architectural principles, coding standards, and our pull request process.
 
 ---
 

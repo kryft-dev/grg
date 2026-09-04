@@ -16,4 +16,5 @@ profile.out
 .DS_Store
 .idea/
 .vscode/
-*.swp
+# Release artifacts
+dist/
