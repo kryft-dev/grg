@@ -2,6 +2,7 @@ package gitengine
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -146,7 +147,7 @@ func TestSafety_Tree_CycleAndMaxDepth(t *testing.T) {
 	reader.objects[treeAOID] = &Object{OID: treeAOID, Type: TypeTree, Data: treeAData}
 	reader.objects[treeBOID] = &Object{OID: treeBOID, Type: TypeTree, Data: treeBData}
 
-	err := TraverseTree(reader, treeAOID, func(path string, entry TreeEntry) error {
+	err := TraverseTree(context.Background(), reader, treeAOID, func(path string, entry TreeEntry) error {
 		return nil
 	})
 	if err == nil {
@@ -187,7 +188,9 @@ func TestSafety_Walker_DeepLinearHistory(t *testing.T) {
 	// Calling traverseExclude on the tip commit traverses all 5000 parents
 	// In the recursive implementation, this risked stack overflow.
 	// With the iterative stack, it completes instantly and safely.
-	walker.traverseExclude(prevSHA, excluded)
+	if err := walker.traverseExclude(context.Background(), prevSHA, excluded); err != nil {
+		t.Fatalf("traverseExclude failed: %v", err)
+	}
 
 	if len(excluded) != numCommits {
 		t.Fatalf("expected %d excluded commits, got %d", numCommits, len(excluded))

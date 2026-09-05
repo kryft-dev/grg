@@ -2,6 +2,7 @@ package gitengine
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -87,12 +88,13 @@ const maxTreeDepth = 256
 
 // TraverseTree recursively traverses a Git tree and calls callback for each entry.
 // If callback returns ErrSkipDir for a tree entry, the subtree will not be descended into.
-func TraverseTree(reader ObjectReader, rootOID string, callback func(path string, entry TreeEntry) error) error {
+// Traversal aborts with ctx.Err() once ctx is cancelled.
+func TraverseTree(ctx context.Context, reader ObjectReader, rootOID string, callback func(path string, entry TreeEntry) error) error {
 	visited := make(map[string]bool)
-	return traverseTreeHelper(reader, rootOID, "", 0, visited, callback)
+	return traverseTreeHelper(ctx, reader, rootOID, "", 0, visited, callback)
 }
 
-func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, depth int, visited map[string]bool, callback func(path string, entry TreeEntry) error) error {
+func traverseTreeHelper(ctx context.Context, reader ObjectReader, treeOID, prefix string, depth int, visited map[string]bool, callback func(path string, entry TreeEntry) error) error {
 	if depth > maxTreeDepth {
 		return fmt.Errorf("%w: tree depth exceeds maximum of %d", ErrCorruptObject, maxTreeDepth)
 	}
@@ -116,6 +118,10 @@ func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, depth int, 
 	}
 
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var entryPath string
 		if prefix == "" {
 			entryPath = entry.Name
@@ -132,7 +138,7 @@ func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, depth int, 
 		}
 
 		if entry.IsTree() {
-			if err := traverseTreeHelper(reader, entry.OID, entryPath, depth+1, visited, callback); err != nil {
+			if err := traverseTreeHelper(ctx, reader, entry.OID, entryPath, depth+1, visited, callback); err != nil {
 				return err
 			}
 		}
@@ -143,7 +149,8 @@ func traverseTreeHelper(reader ObjectReader, treeOID, prefix string, depth int, 
 
 // FindTreeEntry searches rootOID for the tree entry at path (slash-separated).
 // Returns the entry and true if found, or a zero TreeEntry and false if not found.
-func FindTreeEntry(reader ObjectReader, rootOID, path string) (TreeEntry, bool) {
+// A cancelled ctx aborts the descent and reports not-found.
+func FindTreeEntry(ctx context.Context, reader ObjectReader, rootOID, path string) (TreeEntry, bool) {
 	if rootOID == "" || path == "" {
 		return TreeEntry{}, false
 	}
@@ -152,6 +159,10 @@ func FindTreeEntry(reader ObjectReader, rootOID, path string) (TreeEntry, bool) 
 	currOID := rootOID
 
 	for i, part := range parts {
+		if ctx.Err() != nil {
+			return TreeEntry{}, false
+		}
+
 		obj, err := reader.ReadObject(currOID)
 		if err != nil || obj.Type != TypeTree {
 			return TreeEntry{}, false

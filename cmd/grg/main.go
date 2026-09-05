@@ -123,10 +123,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	walker := gitengine.NewHistoryWalker(repo, reader, cfg, pathFilter)
 
 	var occurrences []model.BlobOccurrence
-	err = walker.Walk(func(occ model.BlobOccurrence) error {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
+	err = walker.Walk(ctx, func(occ model.BlobOccurrence) error {
 		occurrences = append(occurrences, occ)
 		return nil
 	})

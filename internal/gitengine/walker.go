@@ -2,6 +2,7 @@ package gitengine
 
 import (
 	"container/heap"
+	"context"
 	"fmt"
 	"regexp"
 	"slices"
@@ -28,8 +29,10 @@ func NewHistoryWalker(repo *RepoInfo, reader ObjectReader, cfg *model.Config, pa
 }
 
 // Walk traverses repository history, pruning subtrees by OID and invoking fn on each blob occurrence.
-func (w *HistoryWalker) Walk(fn func(occ model.BlobOccurrence) error) error {
-	commits, err := w.collectOrderedCommits()
+// Walk aborts with ctx.Err() once ctx is cancelled, including during the initial commit-DAG collection
+// that runs before the first occurrence is emitted.
+func (w *HistoryWalker) Walk(ctx context.Context, fn func(occ model.BlobOccurrence) error) error {
+	commits, err := w.collectOrderedCommits(ctx)
 	if err != nil {
 		return err
 	}
@@ -37,7 +40,10 @@ func (w *HistoryWalker) Walk(fn func(occ model.BlobOccurrence) error) error {
 	seenBlobOcc := make(map[string]bool)
 
 	for _, commit := range commits {
-		if err := w.walkCommitBlobs(commit, seenBlobOcc, fn); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := w.walkCommitBlobs(ctx, commit, seenBlobOcc, fn); err != nil {
 			return err
 		}
 	}
@@ -45,7 +51,7 @@ func (w *HistoryWalker) Walk(fn func(occ model.BlobOccurrence) error) error {
 	return nil
 }
 
-func (w *HistoryWalker) walkCommitBlobs(commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
+func (w *HistoryWalker) walkCommitBlobs(ctx context.Context, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
 	// If ExpandCommits is false and commit has a parent, perform tree diff against first parent
 	if !w.cfg.ExpandCommits && len(commit.Parents) > 0 {
 		parentObj, err := w.reader.ReadObject(commit.Parents[0])
@@ -56,13 +62,13 @@ func (w *HistoryWalker) walkCommitBlobs(commit *model.CommitMetadata, seenBlobOc
 					// Identical root tree: zero files introduced/modified
 					return nil
 				}
-				return w.diffTreesAndEmit(parentCommit.TreeOID, commit.TreeOID, "", commit, seenBlobOcc, fn)
+				return w.diffTreesAndEmit(ctx, parentCommit.TreeOID, commit.TreeOID, "", commit, seenBlobOcc, fn)
 			}
 		}
 	}
 
 	// Full tree traversal for root commits or when ExpandCommits is enabled
-	return TraverseTree(w.reader, commit.TreeOID, func(path string, entry TreeEntry) error {
+	return TraverseTree(ctx, w.reader, commit.TreeOID, func(path string, entry TreeEntry) error {
 		if entry.IsTree() {
 			return nil
 		}
@@ -140,10 +146,14 @@ func compareTreeEntries(a, b TreeEntry) int {
 
 // diffTreesAndEmit performs subtree-pruned tree comparison between oldTreeOID and newTreeOID.
 // Leverages canonical sorted tree entry order with a two-pointer merge to eliminate map allocations.
-func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
+func (w *HistoryWalker) diffTreesAndEmit(ctx context.Context, oldTreeOID, newTreeOID, prefix string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
 	if oldTreeOID == newTreeOID {
 		// Subtree OID match: prune subtree descending entirely!
 		return nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	var oldEntries []TreeEntry
@@ -207,11 +217,11 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 			if hasOld && oldEntry.IsTree() {
 				oldSubOID = oldEntry.OID
 			}
-			if err := w.diffTreesAndEmit(oldSubOID, newEntry.OID, entryPath, commit, seenBlobOcc, fn); err != nil {
+			if err := w.diffTreesAndEmit(ctx, oldSubOID, newEntry.OID, entryPath, commit, seenBlobOcc, fn); err != nil {
 				return err
 			}
 		} else if newEntry.IsBlob() {
-			if err := w.emitBlobOccurrence(newEntry, entryPath, commit, seenBlobOcc, fn); err != nil {
+			if err := w.emitBlobOccurrence(ctx, newEntry, entryPath, commit, seenBlobOcc, fn); err != nil {
 				return err
 			}
 		}
@@ -220,7 +230,7 @@ func (w *HistoryWalker) diffTreesAndEmit(oldTreeOID, newTreeOID, prefix string, 
 	return nil
 }
 
-func (w *HistoryWalker) emitBlobOccurrence(newEntry TreeEntry, entryPath string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
+func (w *HistoryWalker) emitBlobOccurrence(ctx context.Context, newEntry TreeEntry, entryPath string, commit *model.CommitMetadata, seenBlobOcc map[string]bool, fn func(occ model.BlobOccurrence) error) error {
 	if w.pathFilter != nil && !w.pathFilter(entryPath) {
 		return nil
 	}
@@ -230,9 +240,12 @@ func (w *HistoryWalker) emitBlobOccurrence(newEntry TreeEntry, entryPath string,
 	if len(commit.Parents) > 1 && !w.cfg.FirstParent {
 		inOtherParent := false
 		for _, pSHA := range commit.Parents[1:] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			pMeta := w.readCommit(pSHA)
 			if pMeta != nil {
-				if pe, ok := FindTreeEntry(w.reader, pMeta.TreeOID, entryPath); ok && pe.OID == newEntry.OID {
+				if pe, ok := FindTreeEntry(ctx, w.reader, pMeta.TreeOID, entryPath); ok && pe.OID == newEntry.OID {
 					inOtherParent = true
 					break
 				}
@@ -286,7 +299,7 @@ func (h *commitHeap) Pop() any {
 	return x
 }
 
-func (w *HistoryWalker) collectOrderedCommits() ([]*model.CommitMetadata, error) {
+func (w *HistoryWalker) collectOrderedCommits(ctx context.Context) ([]*model.CommitMetadata, error) {
 	spec, err := ParseRevSpec(w.repo, w.reader, w.cfg.RevRange)
 	if err != nil {
 		return nil, err
@@ -312,7 +325,9 @@ func (w *HistoryWalker) collectOrderedCommits() ([]*model.CommitMetadata, error)
 	// Build exclude set from spec.Exclude
 	excluded := make(map[string]bool)
 	for _, exclOID := range spec.Exclude {
-		w.traverseExclude(exclOID, excluded)
+		if err := w.traverseExclude(ctx, exclOID, excluded); err != nil {
+			return nil, err
+		}
 	}
 
 	var authorRe *regexp.Regexp
@@ -350,6 +365,10 @@ func (w *HistoryWalker) collectOrderedCommits() ([]*model.CommitMetadata, error)
 
 	var matchedCommits []*model.CommitMetadata
 	for pq.Len() > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		popped := heap.Pop(pq)
 		commit, ok := popped.(*model.CommitMetadata)
 		if !ok {
@@ -389,9 +408,13 @@ func (w *HistoryWalker) readCommit(sha string) *model.CommitMetadata {
 	return meta
 }
 
-func (w *HistoryWalker) traverseExclude(startSHA string, excluded map[string]bool) {
+func (w *HistoryWalker) traverseExclude(ctx context.Context, startSHA string, excluded map[string]bool) error {
 	stack := []string{startSHA}
 	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		n := len(stack) - 1
 		sha := stack[n]
 		stack = stack[:n]
@@ -410,4 +433,6 @@ func (w *HistoryWalker) traverseExclude(startSHA string, excluded map[string]boo
 			}
 		}
 	}
+
+	return nil
 }

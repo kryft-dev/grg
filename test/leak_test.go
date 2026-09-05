@@ -379,7 +379,7 @@ func TestGoroutineLeak_EndToEndLifecycle(t *testing.T) {
 
 	walker := gitengine.NewHistoryWalker(repoInfo, repoReader, cfg, nil)
 	var occurrences []model.BlobOccurrence
-	err = walker.Walk(func(occ model.BlobOccurrence) error {
+	err = walker.Walk(context.Background(), func(occ model.BlobOccurrence) error {
 		occurrences = append(occurrences, occ)
 		return nil
 	})
