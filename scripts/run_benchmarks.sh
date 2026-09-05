@@ -33,12 +33,22 @@ SKIP_SYNTHETIC=false
 SKIP_REAL=false
 SKIP_LINUX=false
 AUTO_CONFIRM=false
+RUN_BASELINE=true
+
+# hyperfine run counts. Small/medium repos get enough runs for a stable mean;
+# linux is capped because a single run can take minutes.
+SMALL_MIN_RUNS=10
+LARGE_MIN_RUNS=3
+LARGE_MAX_RUNS=5
+WARMUP_RUNS=1
 
 # Metrics tracking
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
-SKIPPED_TESTS=0
+
+# Rows for the generated README table, filled in as scenarios complete
+declare -a README_ROWS=()
 
 log()   { echo -e "${BLUE}[BENCHMARK]${NC} $*"; }
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -77,6 +87,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_LINUX=true
       shift
       ;;
+    --no-baseline)
+      RUN_BASELINE=false
+      shift
+      ;;
     -h|--help)
       cat <<HELP
 Usage: $0 [OPTIONS]
@@ -89,7 +103,13 @@ Options:
   --skip-synthetic    Skip Go synthetic microbenchmarks
   --skip-real         Skip real-world repository benchmarks
   --skip-linux        Skip cloning and benchmarking torvalds/linux (~4GB)
+  --no-baseline       Do not time the 'git log -p | grep' baseline alongside grg
   -h, --help          Show this help message
+
+Requirements: go, git, jq, hyperfine (https://github.com/sharkdp/hyperfine)
+
+The baseline comparison runs on ripgrep and go only. On linux a single
+'git log -p' pass takes far too long to repeat under hyperfine.
 HELP
       exit 0
       ;;
@@ -100,16 +120,36 @@ HELP
   esac
 done
 
-# Signal trap for clean termination
+# Signal handling: INT/TERM convert to an exit status, EXIT does the cleanup
+# exactly once (a combined trap would run cleanup twice on Ctrl-C).
 cleanup() {
   local exit_code=$?
   rm -f "${BENCH_DIR}"/temp_*.md 2>/dev/null || true
   if [[ $exit_code -ne 0 ]]; then
-    echo -e "\n${RED}[ABORT] Benchmark script interrupted or exited with error code ${exit_code}.${NC}"
+    echo -e "\n${RED}[ABORT] Benchmark script interrupted or exited with error code ${exit_code}.${NC}" >&2
   fi
-  exit "${exit_code}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ------------------------------------------------------------------------------
+# PREREQUISITES
+# ------------------------------------------------------------------------------
+# Checked before the banner so a missing tool fails fast instead of after a
+# multi-gigabyte clone. Nothing is installed on the user's behalf.
+MISSING_TOOLS=()
+command -v go        >/dev/null 2>&1 || MISSING_TOOLS+=("go        (https://go.dev/dl/)")
+command -v git       >/dev/null 2>&1 || MISSING_TOOLS+=("git")
+if [[ "${SKIP_REAL}" == false ]]; then
+  command -v jq        >/dev/null 2>&1 || MISSING_TOOLS+=("jq        (apt install jq | brew install jq)")
+  command -v hyperfine >/dev/null 2>&1 || MISSING_TOOLS+=("hyperfine (apt install hyperfine | brew install hyperfine | cargo install hyperfine | https://github.com/sharkdp/hyperfine/releases)")
+fi
+if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
+  error "Missing required tools:"
+  for t in "${MISSING_TOOLS[@]}"; do echo "  - ${t}" >&2; done
+  exit 1
+fi
 
 # ------------------------------------------------------------------------------
 # MASSIVE PRE-RUN WARNING & DISK SPACE AUDIT
@@ -140,17 +180,19 @@ BANNER
 ${BOLD}Resource Requirements:${NC}
   • Total Download Size : ${RED}${BOLD}~4.5 GB of Git Packfiles${NC}
   • Minimum Free Disk   : ${BOLD}12 GB recommended${NC}
-  • Estimated Runtime   : ${BOLD}5 to 20 minutes${NC} (depending on network and disk speed)
+  • Estimated Runtime   : ${BOLD}10 to 40 minutes${NC} (depending on network and disk speed)
+  • Bench Directory     : ${BOLD}${BENCH_DIR}${NC}
 ${YELLOW}################################################################################${NC}
 
 BANNER
 
-  # Check available disk space
+  # Check available disk space where the clones will actually land
+  mkdir -p "${BENCH_DIR}"
   local available_kb
-  available_kb=$(df -k "${REPO_ROOT}" | awk 'NR==2 {print $4}')
+  available_kb=$(df -k "${BENCH_DIR}" | awk 'NR==2 {print $4}')
   local available_gb=$(( available_kb / 1024 / 1024 ))
 
-  info "Available disk space in workspace: ${BOLD}${available_gb} GB${NC}"
+  info "Available disk space in bench directory: ${BOLD}${available_gb} GB${NC}"
 
   if [[ ${available_gb} -lt 8 && "${SKIP_LINUX}" == false ]]; then
     error "Less than 8 GB of free disk space remaining (${available_gb} GB detected)."
@@ -190,15 +232,37 @@ append_output() {
   echo "$@" >> "${OUTPUT_FILE}"
 }
 
+# 1234567 -> 1,234,567
+with_commas() {
+  echo "$1" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta'
+}
+
+# seconds (float) -> "123 ms" ; "N/A" if empty/null
+fmt_ms() {
+  local secs="$1"
+  if [[ -z "${secs}" || "${secs}" == "null" ]]; then
+    echo "N/A"
+  else
+    awk -v s="${secs}" 'BEGIN { printf "%.0f ms", s * 1000 }'
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # 1. HARDWARE ENVIRONMENT & MACHINE SPECIFICATIONS
 # ------------------------------------------------------------------------------
 log "Collecting hardware environment and machine specifications..."
 
 CPU_MODEL=$(lscpu 2>/dev/null | grep "Model name:" | sed 's/Model name:[ \t]*//' || grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "Generic x86_64 CPU")
-CPU_CORES=$(nproc --all 2>/dev/null || echo "4")
+CPU_CORES=$(nproc 2>/dev/null || echo "4")
 TOTAL_MEM=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || echo "N/A")
 OS_INFO=$(uname -s -r -m 2>/dev/null || echo "Linux")
+if [[ -n "${CODESPACES:-}" ]]; then
+  PLATFORM_LABEL="GitHub Codespace"
+elif [[ -n "${CI:-}" ]]; then
+  PLATFORM_LABEL="CI runner"
+else
+  PLATFORM_LABEL="Local machine"
+fi
 
 log "Detected: ${CPU_MODEL} (${CPU_CORES} cores), ${TOTAL_MEM} RAM, ${OS_INFO}"
 
@@ -207,53 +271,25 @@ append_output "grg PRODUCTION BENCHMARK REPORT"
 append_output "Generated at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 append_output "=============================================================================="
 append_output "System Environment:"
+append_output "  - Platform:     ${PLATFORM_LABEL}"
 append_output "  - CPU Model:    ${CPU_MODEL}"
 append_output "  - CPU Cores:    ${CPU_CORES} logical cores"
 append_output "  - Memory:       ${TOTAL_MEM}"
-append_output "  - Platform:     ${OS_INFO}"
+append_output "  - OS:           ${OS_INFO}"
 append_output "=============================================================================="
 append_output ""
 
 # ------------------------------------------------------------------------------
-# 2. PREREQUISITES & COMPILER VALIDATION
+# 2. COMPILER & TOOL VERSIONS
 # ------------------------------------------------------------------------------
-log "Validating Go compiler environment..."
-
-if ! command -v go >/dev/null 2>&1; then
-  error "Go compiler is missing from PATH. Cannot proceed."
-  append_output "FATAL: Go compiler not found."
-  exit 1
-fi
-
 GO_VERSION=$(go version 2>&1 || echo "Go version unknown")
 log "Go Version: ${GO_VERSION}"
 append_output "Compiler: ${GO_VERSION}"
 
-# Hyperfine setup with fallback
-HYPERFINE_AVAILABLE=false
-if command -v hyperfine >/dev/null 2>&1; then
-  HYPERFINE_AVAILABLE=true
-  log "Using installed hyperfine: $(hyperfine --version)"
-else
-  log "hyperfine not detected. Attempting automatic setup..."
-  if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq hyperfine 2>/dev/null || true
-  fi
-
-  if command -v hyperfine >/dev/null 2>&1; then
-    HYPERFINE_AVAILABLE=true
-  else
-    log "Attempting download of standalone static hyperfine binary..."
-    mkdir -p "${BIN_DIR}"
-    if curl -fsSL --connect-timeout 10 "https://github.com/sharkdp/hyperfine/releases/download/v1.19.0/hyperfine-v1.19.0-x86_64-unknown-linux-musl.tar.gz" 2>/dev/null | tar -xz -C "${BIN_DIR}" --strip-components=1 "hyperfine-v1.19.0-x86_64-unknown-linux-musl/hyperfine" 2>/dev/null; then
-      chmod +x "${BIN_DIR}/hyperfine"
-      export PATH="${BIN_DIR}:${PATH}"
-      HYPERFINE_AVAILABLE=true
-      log "Installed static hyperfine to ${BIN_DIR}/hyperfine"
-    else
-      warn "Unable to install hyperfine. Falling back to high-resolution bash timers."
-    fi
-  fi
+if [[ "${SKIP_REAL}" == false ]]; then
+  HYPERFINE_VERSION=$(hyperfine --version 2>&1 | head -1)
+  log "Timing tool: ${HYPERFINE_VERSION}"
+  append_output "Timing tool: ${HYPERFINE_VERSION}"
 fi
 
 # ------------------------------------------------------------------------------
@@ -287,7 +323,7 @@ if [[ "${SKIP_SYNTHETIC}" == false ]]; then
 
   TOTAL_TESTS=$((TOTAL_TESTS + 1))
   cd "${REPO_ROOT}"
-  
+
   if GO_BENCH_OUTPUT=$(go test -run=^$ -bench=. -benchmem -count=3 ./test/benchmark/... 2>&1); then
     pass "Synthetic benchmarks completed successfully."
     PASSED_TESTS=$((PASSED_TESTS + 1))
@@ -310,11 +346,15 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_REAL}" == false ]]; then
   mkdir -p "${BENCH_DIR}"
+  JSON_DIR="${BENCH_DIR}/hyperfine_json"
+  mkdir -p "${JSON_DIR}"
   cd "${BENCH_DIR}"
 
   append_output "------------------------------------------------------------------------------"
   append_output "SECTION 2: REAL-WORLD REPOSITORY BENCHMARKS"
   append_output "------------------------------------------------------------------------------"
+  append_output "Raw hyperfine JSON exports: ${JSON_DIR}"
+  append_output ""
 
   # Repository definitions
   declare -A REPO_URLS
@@ -331,33 +371,48 @@ if [[ "${SKIP_REAL}" == false ]]; then
     fi
 
     REPO_URL="${REPO_URLS[$REPO_NAME]}"
+    REPO_DISPLAY="${REPO_URL#https://github.com/}"
+    REPO_DISPLAY="${REPO_DISPLAY%.git}"
     TARGET_DIR="${BENCH_DIR}/${REPO_NAME}"
+    REPACK_MARKER="${TARGET_DIR}/.git/grg-bench-repacked"
 
     log "Preparing repository: ${REPO_NAME} (${REPO_URL})..."
 
-    # Unhappy path: Git clone with error handling & retry
+    # Unhappy path: Git clone with error handling
     CLONE_SUCCESS=true
     if [[ ! -d "${TARGET_DIR}/.git" ]]; then
       log "Cloning ${REPO_NAME} (this may take several minutes)..."
       rm -rf "${TARGET_DIR}" 2>/dev/null || true
 
-      if ! git clone "${REPO_URL}" "${TARGET_DIR}" 2>&1; then
+      if git clone "${REPO_URL}" "${TARGET_DIR}" 2>&1; then
+        # A fresh clone already arrives as a single optimized pack.
+        touch "${REPACK_MARKER}"
+      else
         error "Failed to clone ${REPO_NAME} from ${REPO_URL}."
         rm -rf "${TARGET_DIR}" 2>/dev/null || true
         CLONE_SUCCESS=false
       fi
     else
       info "Repository ${REPO_NAME} already exists in ${TARGET_DIR}."
-      if [[ "${SKIP_CLONE}" == false ]]; then
-        info "Running git repack to optimize packfiles for benchmark accuracy..."
-        (cd "${TARGET_DIR}" && git repack -a -d -q 2>/dev/null || true)
+      if [[ "${SKIP_CLONE}" == true ]]; then
+        info "Skipping repack (--skip-clone)."
+      elif [[ -f "${REPACK_MARKER}" ]]; then
+        info "Packfiles already optimized on a previous run; skipping repack."
+      else
+        info "Running git repack to optimize packfiles for benchmark accuracy (one-time)..."
+        if (cd "${TARGET_DIR}" && git repack -a -d -q 2>/dev/null); then
+          touch "${REPACK_MARKER}"
+        else
+          warn "git repack failed for ${REPO_NAME}; continuing with existing packfiles."
+        fi
       fi
     fi
 
     if [[ "${CLONE_SUCCESS}" == false ]]; then
       error "Skipping benchmarks for ${REPO_NAME} due to clone failure."
       append_output "Repository: ${REPO_NAME} - CLONE FAILED"
-      FAILED_TESTS=$((FAILED_TESTS + 4))
+      FAILED_TESTS=$((FAILED_TESTS + 5))
+      TOTAL_TESTS=$((TOTAL_TESTS + 5))
       continue
     fi
 
@@ -365,6 +420,7 @@ if [[ "${SKIP_REAL}" == false ]]; then
     COMMIT_COUNT=$(git -C "${TARGET_DIR}" rev-list --count HEAD 2>/dev/null || echo "N/A")
     PACK_SIZE=$(du -sh "${TARGET_DIR}/.git/objects/pack" 2>/dev/null | cut -f1 || echo "N/A")
     TOTAL_DISK=$(du -sh "${TARGET_DIR}" 2>/dev/null | cut -f1 || echo "N/A")
+    COMMIT_COUNT_FMT=$(with_commas "${COMMIT_COUNT}")
 
     log "${REPO_NAME}: ${COMMIT_COUNT} commits | Pack Size: ${PACK_SIZE} | Total On Disk: ${TOTAL_DISK}"
 
@@ -375,95 +431,136 @@ if [[ "${SKIP_REAL}" == false ]]; then
     append_output "Commits: ${COMMIT_COUNT} | Pack Size: ${PACK_SIZE} | Total Disk: ${TOTAL_DISK}"
     append_output "=============================================================================="
 
-    # Scenario matrix per repository
+    # Run counts and baseline policy per repository size
+    if [[ "${REPO_NAME}" == "linux" ]]; then
+      RUN_FLAGS=(--warmup "${WARMUP_RUNS}" --min-runs "${LARGE_MIN_RUNS}" --max-runs "${LARGE_MAX_RUNS}")
+      REPO_BASELINE=false
+    else
+      RUN_FLAGS=(--warmup "${WARMUP_RUNS}" --min-runs "${SMALL_MIN_RUNS}")
+      REPO_BASELINE="${RUN_BASELINE}"
+    fi
+
+    # Scenario matrix per repository. Each entry is a '|'-separated record:
+    #   name | grg arguments | ERE for the grep baseline | git pathspec | grep flags
+    # The baseline is the conventional way to search history without grg:
+    #   git log -p --format= [-- PATHSPEC] | grep <flags> 'ERE'
+    # Count scenarios use grep -c; the full-output scenario prints matches.
     declare -a SCENARIOS
     case "${REPO_NAME}" in
       ripgrep)
         SCENARIOS=(
-          "Common Term: 'TODO'" "--color=never -c TODO"
-          "Rare Identifier: 'regex_syntax'" "--color=never -c regex_syntax"
-          "Regex Pattern: 'fn\s+[a-z_]+'" "--color=never -c 'fn\s+[a-z_]+'"
-          "Path-Filtered: 'unsafe' in '*.rs'" "--color=never -g '*.rs' -c unsafe"
+          "Common Term: 'TODO'|--color=never -c TODO|TODO||-cE"
+          "Rare Identifier: 'regex_syntax'|--color=never -c regex_syntax|regex_syntax||-cE"
+          "Regex Pattern: 'fn\s+[a-z_]+'|--color=never -c 'fn\s+[a-z_]+'|fn\s+[a-z_]+||-cE"
+          "Path-Filtered: 'unsafe' in '*.rs'|--color=never -g '*.rs' -c unsafe|unsafe|*.rs|-cE"
+          "Full Output: 'TODO' (formatted matches)|--color=never --no-heading TODO|TODO||-E"
         )
         ;;
       go)
         SCENARIOS=(
-          "Common Term: 'TODO'" "--color=never -c TODO"
-          "Rare Identifier: 'runtime.throw'" "--color=never -c runtime.throw"
-          "Regex Pattern: 'func\s+[A-Z][a-zA-Z0-9_]*'" "--color=never -c 'func\s+[A-Z][a-zA-Z0-9_]*'"
-          "Path-Filtered: 'sync.Mutex' in 'src/'" "--color=never -c sync.Mutex -- src/"
+          "Common Term: 'TODO'|--color=never -c TODO|TODO||-cE"
+          "Rare Identifier: 'runtime.throw'|--color=never -c runtime.throw|runtime.throw||-cE"
+          "Regex Pattern: 'func\s+[A-Z][a-zA-Z0-9_]*'|--color=never -c 'func\s+[A-Z][a-zA-Z0-9_]*'|func\s+[A-Z][a-zA-Z0-9_]*||-cE"
+          "Path-Filtered: 'sync.Mutex' in 'src/'|--color=never -c sync.Mutex -- src/|sync.Mutex|src/|-cE"
+          "Full Output: 'TODO' (formatted matches)|--color=never --no-heading TODO|TODO||-E"
         )
         ;;
       linux)
         SCENARIOS=(
-          "Common Term: 'TODO'" "--color=never -c TODO"
-          "Rare Identifier: 'GFP_KERNEL'" "--color=never -c GFP_KERNEL"
-          "Regex Pattern: 'static\s+int\s+__init'" "--color=never -c 'static\s+int\s+__init'"
-          "Path-Filtered: 'EXPORT_SYMBOL' in 'kernel/'" "--color=never -c EXPORT_SYMBOL -- kernel/"
+          "Common Term: 'TODO'|--color=never -c TODO|TODO||-cE"
+          "Rare Identifier: 'GFP_KERNEL'|--color=never -c GFP_KERNEL|GFP_KERNEL||-cE"
+          "Regex Pattern: 'static\s+int\s+__init'|--color=never -c 'static\s+int\s+__init'|static\s+int\s+__init||-cE"
+          "Path-Filtered: 'EXPORT_SYMBOL' in 'kernel/'|--color=never -c EXPORT_SYMBOL -- kernel/|EXPORT_SYMBOL|kernel/|-cE"
+          "Full Output: 'TODO' (formatted matches)|--color=never --no-heading TODO|TODO||-E"
         )
         ;;
     esac
 
-    for ((i=0; i<${#SCENARIOS[@]}; i+=2)); do
-      SCENARIO_NAME="${SCENARIOS[$i]}"
-      SCENARIO_ARGS="${SCENARIOS[$i+1]}"
+    for ((i=0; i<${#SCENARIOS[@]}; i++)); do
+      IFS='|' read -r SCENARIO_NAME SCENARIO_ARGS BASE_ERE BASE_PATHSPEC BASE_GREP_FLAGS <<<"${SCENARIOS[$i]}"
       TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
       log "Benchmarking [${REPO_NAME}] -> ${SCENARIO_NAME}..."
       append_output ">>> Scenario: ${SCENARIO_NAME}"
       append_output "Command: grg ${SCENARIO_ARGS}"
 
-      # Pre-flight check: verify grg executes the query without crashing
-      PREFLIGHT_ERR=""
-      if ! PREFLIGHT_ERR=$(cd "${TARGET_DIR}" && eval "${GRG_BIN} ${SCENARIO_ARGS}" >/dev/null 2>&1); then
-        # Note: Exit code 1 means no match found, which is a valid ripgrep result
-        PREFLIGHT_EXIT=$?
-        if [[ ${PREFLIGHT_EXIT} -ne 1 && ${PREFLIGHT_EXIT} -ne 0 ]]; then
-          error "grg exited with unexpected code ${PREFLIGHT_EXIT} for scenario: ${SCENARIO_NAME}"
-          FAILED_TESTS=$((FAILED_TESTS + 1))
-          append_output "STATUS: FAILED (Exit code: ${PREFLIGHT_EXIT})"
-          append_output "Error detail: ${PREFLIGHT_ERR}"
-          append_output ""
-          continue
+      # Build the command strings hyperfine will hand to /bin/sh. hyperfine
+      # discards command stdout by default, so the full-output scenario measures
+      # formatting cost without terminal rendering cost.
+      CD_PREFIX="cd $(printf '%q' "${TARGET_DIR}") &&"
+      GRG_CMD="${CD_PREFIX} $(printf '%q' "${GRG_BIN}") ${SCENARIO_ARGS}"
+      HF_NAMES=(-n "grg")
+      HF_CMDS=("${GRG_CMD}")
+
+      if [[ "${REPO_BASELINE}" == true ]]; then
+        BASE_CMD="${CD_PREFIX} git log -p --format= --no-color"
+        if [[ -n "${BASE_PATHSPEC}" ]]; then
+          BASE_CMD+=" -- $(printf '%q' "${BASE_PATHSPEC}")"
         fi
+        BASE_CMD+=" | grep ${BASE_GREP_FLAGS} $(printf '%q' "${BASE_ERE}")"
+        HF_NAMES+=(-n "git log -p | grep")
+        HF_CMDS+=("${BASE_CMD}")
+        append_output "Baseline: ${BASE_CMD#"${CD_PREFIX} "}"
       fi
 
-      # Execute timing
-      if [[ "${HYPERFINE_AVAILABLE}" == true ]]; then
-        TEMP_MD="${BENCH_DIR}/temp_${REPO_NAME}_${i}.md"
-        rm -f "${TEMP_MD}" 2>/dev/null || true
+      JSON_FILE="${JSON_DIR}/${REPO_NAME}_${i}.json"
+      rm -f "${JSON_FILE}" 2>/dev/null || true
 
-        if hyperfine --warmup 1 --runs 3 \
-          --export-markdown "${TEMP_MD}" \
-          "cd ${TARGET_DIR} && ${GRG_BIN} ${SCENARIO_ARGS}" 2>&1 | tee -a "${OUTPUT_FILE}"; then
-          pass "Completed: ${SCENARIO_NAME}"
-          PASSED_TESTS=$((PASSED_TESTS + 1))
-          if [[ -f "${TEMP_MD}" ]]; then
-            append_output ""
-            cat "${TEMP_MD}" >> "${OUTPUT_FILE}"
-            append_output ""
-            rm -f "${TEMP_MD}"
-          fi
-        else
-          warn "Hyperfine encountered a timing anomaly on scenario: ${SCENARIO_NAME}"
-          FAILED_TESTS=$((FAILED_TESTS + 1))
-          append_output "STATUS: FAILED DURING TIMING"
-        fi
+      # --ignore-failure: grg (and grep -c) exit 1 when nothing matches, which is
+      # a valid result. Real crashes are detected from the exported exit codes.
+      if ! hyperfine "${RUN_FLAGS[@]}" --ignore-failure \
+          --export-json "${JSON_FILE}" \
+          "${HF_NAMES[@]}" "${HF_CMDS[@]}" 2>&1 | tee -a "${OUTPUT_FILE}"; then
+        warn "hyperfine failed on scenario: ${SCENARIO_NAME}"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        append_output "STATUS: FAILED DURING TIMING"
+        README_ROWS+=("| **${REPO_DISPLAY}** | ${COMMIT_COUNT_FMT} | ${PACK_SIZE} | ${SCENARIO_NAME} | *failed* | *failed* | – |")
+        append_output ""
+        continue
+      fi
+
+      if [[ ! -s "${JSON_FILE}" ]]; then
+        warn "hyperfine produced no JSON export for scenario: ${SCENARIO_NAME}"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        append_output "STATUS: FAILED (no timing data)"
+        README_ROWS+=("| **${REPO_DISPLAY}** | ${COMMIT_COUNT_FMT} | ${PACK_SIZE} | ${SCENARIO_NAME} | *failed* | *failed* | – |")
+        append_output ""
+        continue
+      fi
+
+      # Any grg exit code other than 0 (match) or 1 (no match) is a crash.
+      BAD_EXITS=$(jq -r '[(.results[0].exit_codes // [])[] | select(. != 0 and . != 1)] | unique | join(",")' "${JSON_FILE}")
+      GRG_MEAN=$(jq -r '.results[0].mean' "${JSON_FILE}")
+      GRG_STDDEV=$(jq -r '.results[0].stddev // empty' "${JSON_FILE}")
+      GRG_RUNS=$(jq -r '.results[0].times | length' "${JSON_FILE}")
+
+      if [[ -n "${BAD_EXITS}" ]]; then
+        error "grg exited with unexpected code(s) ${BAD_EXITS} for scenario: ${SCENARIO_NAME}"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        append_output "STATUS: FAILED (grg exit codes: ${BAD_EXITS})"
+        README_ROWS+=("| **${REPO_DISPLAY}** | ${COMMIT_COUNT_FMT} | ${PACK_SIZE} | ${SCENARIO_NAME} | *failed (exit ${BAD_EXITS})* | – | – |")
+        append_output ""
+        continue
+      fi
+
+      GRG_CELL="$(fmt_ms "${GRG_MEAN}") ± $(fmt_ms "${GRG_STDDEV}")"
+      if [[ "${REPO_BASELINE}" == true ]]; then
+        BASE_MEAN=$(jq -r '.results[1].mean' "${JSON_FILE}")
+        BASE_STDDEV=$(jq -r '.results[1].stddev // empty' "${JSON_FILE}")
+        BASE_CELL="$(fmt_ms "${BASE_MEAN}") ± $(fmt_ms "${BASE_STDDEV}")"
+        SPEEDUP=$(awk -v b="${BASE_MEAN}" -v g="${GRG_MEAN}" 'BEGIN { if (g > 0) printf "%.1f×", b / g; else print "N/A" }')
       else
-        # Fallback to high-precision timestamp timing
-        START_NS=$(date +%s%N)
-        if (cd "${TARGET_DIR}" && eval "${GRG_BIN} ${SCENARIO_ARGS}" >/dev/null 2>&1); then
-          END_NS=$(date +%s%N)
-          DURATION_MS=$(( (END_NS - START_NS) / 1000000 ))
-          pass "Completed: ${SCENARIO_NAME} in ${DURATION_MS} ms"
-          PASSED_TESTS=$((PASSED_TESTS + 1))
-          append_output "Execution Time: ${DURATION_MS} ms"
-        else
-          error "Execution failed for scenario: ${SCENARIO_NAME}"
-          FAILED_TESTS=$((FAILED_TESTS + 1))
-          append_output "STATUS: EXECUTION FAILED"
-        fi
+        BASE_CELL="*not run*"
+        SPEEDUP="–"
       fi
+
+      pass "Completed: ${SCENARIO_NAME} (grg ${GRG_CELL}, ${GRG_RUNS} runs)"
+      PASSED_TESTS=$((PASSED_TESTS + 1))
+      append_output "grg: mean ${GRG_CELL} over ${GRG_RUNS} runs"
+      if [[ "${REPO_BASELINE}" == true ]]; then
+        append_output "git log -p | grep: mean ${BASE_CELL} (grg ${SPEEDUP} faster)"
+      fi
+      README_ROWS+=("| **${REPO_DISPLAY}** | ${COMMIT_COUNT_FMT} | ${PACK_SIZE} | ${SCENARIO_NAME} | ${GRG_CELL} | ${BASE_CELL} | ${SPEEDUP} |")
       append_output ""
     done
   done
@@ -488,20 +585,21 @@ append_output ""
 append_output "\`grg\` is engineered from the ground up for maximum throughput across long Git histories without requiring working tree checkouts."
 append_output ""
 append_output "### Benchmark Environment"
-append_output "- **Platform**: GitHub Codespace (${CPU_MODEL}, ${CPU_CORES} logical cores, ${TOTAL_MEM} RAM)"
+append_output "- **Platform**: ${PLATFORM_LABEL}"
+append_output "- **Hardware**: ${CPU_MODEL}, ${CPU_CORES} logical cores, ${TOTAL_MEM} RAM"
 append_output "- **OS**: ${OS_INFO}"
-append_output "- **Methodology**: Statistical mean over multiple runs via \`hyperfine\` (1 warmup, 3 iterations)"
+append_output "- **Methodology**: Mean ± standard deviation via \`hyperfine\` (${WARMUP_RUNS} warmup run, at least ${SMALL_MIN_RUNS} timed runs; ${LARGE_MIN_RUNS} to ${LARGE_MAX_RUNS} runs on linux). Timings measured $(date -u +"%Y-%m-%d")."
+append_output "- **Baseline**: \`git log -p --format= | grep\`, the conventional way to search history without \`grg\`. Note that the baseline only scans diff hunks, while \`grg\` scans full blob contents at every commit, so \`grg\` does strictly more work per commit."
 append_output ""
 append_output "### Real-World Repository Search Scalability"
-append_output "| Repository | Scale | Commits | Packfile Size | Query Scenario | Search Time |"
-append_output "| :--- | :---: | :---: | :---: | :--- | :---: |"
-append_output "| **BurntSushi/ripgrep** | Small | ~3,000 | ~15 MB | Common (\`TODO\`) | *(See Section 2 above)* |"
-append_output "| **BurntSushi/ripgrep** | Small | ~3,000 | ~15 MB | Filtered (\`unsafe\` in \`*.rs\`) | *(See Section 2 above)* |"
-append_output "| **golang/go** | Medium | ~60,000 | ~400 MB | Common (\`TODO\`) | *(See Section 2 above)* |"
-append_output "| **golang/go** | Medium | ~60,000 | ~400 MB | Regex (\`func\s+[A-Z]...\`) | *(See Section 2 above)* |"
-if [[ "${SKIP_LINUX}" == false ]]; then
-  append_output "| **torvalds/linux** | Large | ~1,200,000 | ~3.8 GB | Common (\`TODO\`) | *(See Section 2 above)* |"
-  append_output "| **torvalds/linux** | Large | ~1,200,000 | ~3.8 GB | Filtered (\`EXPORT_SYMBOL\` in \`kernel/\`) | *(See Section 2 above)* |"
+append_output "| Repository | Commits | Packfile | Query Scenario | grg | git log -p \\| grep | Speedup |"
+append_output "| :--- | ---: | ---: | :--- | ---: | ---: | ---: |"
+if [[ ${#README_ROWS[@]} -gt 0 ]]; then
+  for row in "${README_ROWS[@]}"; do
+    append_output "${row}"
+  done
+else
+  append_output "| *(no real-world scenarios were run)* | | | | | | |"
 fi
 append_output ""
 append_output "---"
