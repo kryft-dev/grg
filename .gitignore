@@ -18,3 +18,9 @@ profile.out
 .vscode/
 # Release artifacts
 dist/
+
+# Benchmark artifacts
+bin/
+_bench_repos/
+benchmark_results.txt
+
