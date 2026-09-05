@@ -3,6 +3,7 @@ package filter
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -13,8 +14,10 @@ type FileTypeDef struct {
 	Filenames  []string
 }
 
-// BuiltinTypes provides standard file type mappings matching ripgrep conventions.
-var BuiltinTypes = map[string]FileTypeDef{
+// builtinTypes provides standard file type mappings matching ripgrep conventions.
+// Treat it as immutable: read it only through LookupType and ListTypes, which
+// hand out defensive copies so callers cannot mutate the table.
+var builtinTypes = map[string]FileTypeDef{
 	"c":          {Extensions: []string{".c", ".h"}},
 	"cpp":        {Extensions: []string{".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++"}},
 	"css":        {Extensions: []string{".css", ".scss", ".sass", ".less"}},
@@ -75,7 +78,7 @@ func NewTypeMatcher(types []string) (*TypeMatcher, error) {
 			continue
 		}
 
-		def, ok := BuiltinTypes[typeName]
+		def, ok := LookupType(typeName)
 		if !ok {
 			return nil, fmt.Errorf("unknown file type %q (use --type-list to view supported types)", t)
 		}
@@ -113,10 +116,24 @@ func (tm *TypeMatcher) Match(path string) bool {
 	return false
 }
 
+// LookupType returns the definition for the named file type. The returned
+// FileTypeDef owns copies of its slices, so callers may mutate them without
+// corrupting the builtin table.
+func LookupType(name string) (FileTypeDef, bool) {
+	def, ok := builtinTypes[name]
+	if !ok {
+		return FileTypeDef{}, false
+	}
+	return FileTypeDef{
+		Extensions: slices.Clone(def.Extensions),
+		Filenames:  slices.Clone(def.Filenames),
+	}, true
+}
+
 // ListTypes returns a sorted list of all supported file type names.
 func ListTypes() []string {
-	names := make([]string, 0, len(BuiltinTypes))
-	for name := range BuiltinTypes {
+	names := make([]string, 0, len(builtinTypes))
+	for name := range builtinTypes {
 		names = append(names, name)
 	}
 	sort.Strings(names)

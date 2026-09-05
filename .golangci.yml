@@ -102,12 +102,6 @@ linters:
         path: internal/aggregator/aggregator\.go
         text: "(ineffectual assignment to cm|SA4006)"
 
-      # Unused: zlibPool field in PackReader is reserved for Wave 3 Track C reader pooling
-      - linters:
-          - unused
-        path: internal/gitengine/pack\.go
-        text: "field zlibPool is unused"
-
       # Staticcheck: Empty branch in integration test awaiting Wave 3 exit code assertion
       - linters:
           - staticcheck

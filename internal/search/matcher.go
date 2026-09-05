@@ -11,6 +11,10 @@ import (
 )
 
 // Matcher performs pattern matching on blob content according to search configurations.
+//
+// A Matcher is immutable after construction: nothing is written to it after
+// NewMatcher returns, and *regexp.Regexp is itself safe for concurrent use, so
+// one Matcher may be shared by every pipeline worker.
 type Matcher struct {
 	re            *regexp.Regexp
 	cfg           *model.Config

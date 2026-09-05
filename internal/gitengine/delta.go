@@ -103,8 +103,11 @@ func ApplyDelta(base, delta []byte) ([]byte, error) {
 	return applyDeltaInstructions(target, base, delta[pos:], targetSize)
 }
 
-// ApplyDeltaWithBuffer decodes the delta into a caller-supplied or pooled buffer.
-func ApplyDeltaWithBuffer(targetBuf []byte, base, delta []byte) ([]byte, error) {
+// ApplyDeltaWithBuffer decodes the delta into the buffer pointed to by targetBuf,
+// which must be non-nil. When the decoded target does not fit, a larger array is
+// allocated and written back through targetBuf so that a caller recycling a
+// pooled buffer keeps the grown array instead of the outgrown one.
+func ApplyDeltaWithBuffer(targetBuf *[]byte, base, delta []byte) ([]byte, error) {
 	baseSize, targetSize, pos, err := ReadDeltaHeader(delta)
 	if err != nil {
 		return nil, err
@@ -114,13 +117,18 @@ func ApplyDeltaWithBuffer(targetBuf []byte, base, delta []byte) ([]byte, error) 
 		return nil, fmt.Errorf("%w: expected base size %d, got %d", ErrDeltaBaseMismatch, baseSize, len(base))
 	}
 
-	if cap(targetBuf) < targetSize {
-		targetBuf = make([]byte, 0, targetSize)
+	if cap(*targetBuf) < targetSize {
+		*targetBuf = make([]byte, 0, targetSize)
 	} else {
-		targetBuf = targetBuf[:0]
+		*targetBuf = (*targetBuf)[:0]
 	}
 
-	return applyDeltaInstructions(targetBuf, base, delta[pos:], targetSize)
+	target, err := applyDeltaInstructions(*targetBuf, base, delta[pos:], targetSize)
+	if err != nil {
+		return nil, err
+	}
+	*targetBuf = target
+	return target, nil
 }
 
 func applyDeltaInstructions(target []byte, base, instructions []byte, targetSize int) ([]byte, error) {

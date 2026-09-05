@@ -13,7 +13,36 @@ import (
 	"github.com/klauspost/compress/zlib"
 )
 
+// resettableZlibReader is a pooled zlib reader that can be rebound to a new source.
+type resettableZlibReader interface {
+	io.ReadCloser
+	zlib.Resetter
+}
+
+// newPooledZlibReader binds a reader from pool to src, falling back to a fresh
+// zlib reader when the pool is empty.
+//
+// A failed Reset is terminal for src: zlib.Reset consumes the two-byte RFC-1950
+// header eagerly and installs its own bufio.Reader with up to 4 KiB of read-ahead
+// before it can report an error, so src is no longer positioned at the start of
+// the stream. Retrying with zlib.NewReader(src) would parse from a mutated offset
+// and report a misleading error about genuinely corrupt input, so the Reset error
+// is returned as-is instead.
+func newPooledZlibReader(pool *sync.Pool, src io.Reader) (io.ReadCloser, error) {
+	if pooled, ok := pool.Get().(resettableZlibReader); ok {
+		if err := pooled.Reset(src, nil); err != nil {
+			return nil, err
+		}
+		return pooled, nil
+	}
+	return zlib.NewReader(src)
+}
+
 // LooseReader provides read access to loose Git objects located in .git/objects/??/*
+//
+// Concurrency: safe for concurrent use by multiple goroutines. It holds no open
+// file handles between calls — each read opens and closes its own file — and its
+// only mutable state is the zlib reader pool.
 type LooseReader struct {
 	objectsDir string
 	zlibPool   sync.Pool
@@ -66,23 +95,9 @@ func (r *LooseReader) ReadObject(oid string) (*Object, error) {
 	}
 	defer f.Close()
 
-	var zReader io.ReadCloser
-	if pooled := r.zlibPool.Get(); pooled != nil {
-		if zr, ok := pooled.(zlib.Resetter); ok {
-			if resetErr := zr.Reset(f, nil); resetErr == nil {
-				if rc, ok := pooled.(io.ReadCloser); ok {
-					zReader = rc
-				}
-			}
-		}
-	}
-
-	if zReader == nil {
-		var zErr error
-		zReader, zErr = zlib.NewReader(f)
-		if zErr != nil {
-			return nil, fmt.Errorf("%w: failed to create zlib reader for %s: %v", ErrCorruptObject, oid, zErr)
-		}
+	zReader, err := newPooledZlibReader(&r.zlibPool, f)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to create zlib reader for %s: %v", ErrCorruptObject, oid, err)
 	}
 	defer func() {
 		_ = zReader.Close()

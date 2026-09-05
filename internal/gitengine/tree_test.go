@@ -2,6 +2,7 @@ package gitengine
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -96,7 +97,7 @@ func TestParseTreeAndTraverse(t *testing.T) {
 
 	// Test TraverseTree
 	visited := make(map[string]string)
-	err = TraverseTree(reader, rootTreeOID, func(path string, entry TreeEntry) error {
+	err = TraverseTree(context.Background(), reader, rootTreeOID, func(path string, entry TreeEntry) error {
 		visited[path] = entry.OID
 		return nil
 	})
@@ -113,7 +114,7 @@ func TestParseTreeAndTraverse(t *testing.T) {
 
 	// Test ErrSkipDir
 	visitedSkipped := make(map[string]string)
-	err = TraverseTree(reader, rootTreeOID, func(path string, entry TreeEntry) error {
+	err = TraverseTree(context.Background(), reader, rootTreeOID, func(path string, entry TreeEntry) error {
 		visitedSkipped[path] = entry.OID
 		if entry.IsTree() && entry.Name == "src" {
 			return ErrSkipDir

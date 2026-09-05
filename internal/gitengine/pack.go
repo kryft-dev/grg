@@ -9,25 +9,39 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
-	"github.com/klauspost/compress/zlib"
 )
 
+// packMagic is the 4-byte header magic of a .pack file.
+const packMagic = "PACK"
+
 var (
-	packMagic = []byte{'P', 'A', 'C', 'K'}
 	// ErrPackInvalid indicates a malformed or unsupported packfile.
 	ErrPackInvalid = errors.New("invalid packfile")
 )
 
 const maxDeltaDepth = 50
 
-// PackReader provides thread-safe random read access to a Git .pack file using its .idx index.
+// deltaBaseResolver resolves an OBJ_REF_DELTA base object that may live outside
+// the packfile holding the delta. It carries the current delta-chain depth across
+// the hop so that maxDeltaDepth bounds mixed OFS/REF chains and terminates
+// REF_DELTA cycles. It is deliberately unexported and narrower than ObjectReader:
+// every implementation must be able to continue the depth count, which an
+// arbitrary external ObjectReader cannot.
+type deltaBaseResolver interface {
+	readObjectDepth(oid string, depth int) (*Object, error)
+}
+
+// PackReader provides thread-safe random read access to a Git .pack file using its
+// .idx index. Every field is immutable once OpenPackfile returns (resolver is wired
+// by NewRepositoryReader before the reader is published), so concurrent readers only
+// share the pooled zlib readers and the positional reads on file, both of which are
+// safe for concurrent use.
 type PackReader struct {
 	packPath string
 	file     *os.File
 	fileSize int64
 	idx      *PackIndex
-	resolver ObjectReader
+	resolver deltaBaseResolver
 	zlibPool sync.Pool
 }
 
@@ -56,7 +70,7 @@ func OpenPackfile(packPath, idxPath string) (*PackReader, error) {
 		return nil, fmt.Errorf("%w: failed to read pack header: %v", ErrPackInvalid, err)
 	}
 
-	if string(hdr[:4]) != string(packMagic) {
+	if string(hdr[:4]) != packMagic {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: invalid pack magic %q", ErrPackInvalid, string(hdr[:4]))
 	}
@@ -100,11 +114,6 @@ func OpenPackfiles(commonGitDir string) ([]*PackReader, error) {
 	return readers, nil
 }
 
-// SetResolver sets an ObjectReader to resolve external base objects for OBJ_REF_DELTA.
-func (p *PackReader) SetResolver(resolver ObjectReader) {
-	p.resolver = resolver
-}
-
 // HasObject checks if the pack index contains the given OID.
 func (p *PackReader) HasObject(oid string) bool {
 	return p.idx.HasObject(oid)
@@ -112,12 +121,20 @@ func (p *PackReader) HasObject(oid string) bool {
 
 // ReadObject reads and decompresses the object corresponding to oid.
 func (p *PackReader) ReadObject(oid string) (*Object, error) {
+	return p.readObjectDepth(oid, 0)
+}
+
+// readObjectDepth reads the object corresponding to oid, treating depth as the
+// number of delta hops already traversed to get here. Resolving an OBJ_REF_DELTA
+// base enters through this method instead of ReadObject so the depth count is not
+// reset on every hop.
+func (p *PackReader) readObjectDepth(oid string, depth int) (*Object, error) {
 	offset, err := p.idx.FindOffset(oid)
 	if err != nil {
 		return nil, err
 	}
 
-	obj, err := p.readObjectAt(offset, 0)
+	obj, err := p.readObjectAt(offset, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +248,7 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 		}
 
 		deltaBuf := GetDeltaBuffer()
-		targetData, err := ApplyDeltaWithBuffer(*deltaBuf, baseObj.Data, deltaBytes)
+		targetData, err := ApplyDeltaWithBuffer(deltaBuf, baseObj.Data, deltaBytes)
 		if baseObj.poolBuf != nil {
 			PutDeltaBuffer(baseObj.poolBuf)
 			baseObj.poolBuf = nil
@@ -275,16 +292,16 @@ func (p *PackReader) readObjectAt(offset int64, depth int) (*Object, error) {
 
 		var baseObj *Object
 		if p.resolver != nil {
-			baseObj, err = p.resolver.ReadObject(baseOID)
+			baseObj, err = p.resolver.readObjectDepth(baseOID, depth+1)
 		} else {
-			baseObj, err = p.ReadObject(baseOID)
+			baseObj, err = p.readObjectDepth(baseOID, depth+1)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve base object %s for ref_delta: %w", baseOID, err)
 		}
 
 		deltaBuf := GetDeltaBuffer()
-		targetData, err := ApplyDeltaWithBuffer(*deltaBuf, baseObj.Data, deltaBytes)
+		targetData, err := ApplyDeltaWithBuffer(deltaBuf, baseObj.Data, deltaBytes)
 		if baseObj.poolBuf != nil {
 			PutDeltaBuffer(baseObj.poolBuf)
 			baseObj.poolBuf = nil
@@ -322,23 +339,9 @@ func (p *PackReader) decompressZlib(r io.Reader, size int64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: object size %d exceeds limit", ErrCorruptObject, size)
 	}
 
-	var zReader io.ReadCloser
-	if pooled := p.zlibPool.Get(); pooled != nil {
-		if zr, ok := pooled.(zlib.Resetter); ok {
-			if resetErr := zr.Reset(r, nil); resetErr == nil {
-				if rc, ok := pooled.(io.ReadCloser); ok {
-					zReader = rc
-				}
-			}
-		}
-	}
-
-	if zReader == nil {
-		var zErr error
-		zReader, zErr = zlib.NewReader(r)
-		if zErr != nil {
-			return nil, fmt.Errorf("%w: failed to init zlib decompressor: %v", ErrCorruptObject, zErr)
-		}
+	zReader, err := newPooledZlibReader(&p.zlibPool, r)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to init zlib decompressor: %v", ErrCorruptObject, err)
 	}
 	defer func() {
 		_ = zReader.Close()

@@ -25,18 +25,36 @@ import (
 )
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	os.Exit(realMain())
+}
+
+// realMain owns the whole run and returns the process exit code. main does
+// nothing but hand that code to os.Exit, which runs no deferred functions:
+// exiting from inside this function would skip signal cleanup on every
+// non-zero exit, and exit code 1 (no match found) is the common case.
+func realMain() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Release the signal handler as soon as the first signal cancels ctx. That
+	// restores the default signal disposition, so a second Ctrl-C terminates
+	// the process immediately instead of being swallowed by a handler that
+	// would otherwise stay installed for the whole run. This goroutine cannot
+	// leak: defer stop() cancels ctx on the normal path too, so <-ctx.Done()
+	// always returns.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	if err := runContext(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		ec := exitCodeForError(err)
-		if ec != 1 {
-			if !isQuietError(err) {
-				fmt.Fprintf(os.Stderr, "grg: %v\n", err)
-			}
+		if ec != 1 && !isQuietError(err) {
+			fmt.Fprintf(os.Stderr, "grg: %v\n", err)
 		}
-		os.Exit(ec)
+		return ec
 	}
+	return 0
 }
 
 func run(args []string) error {
@@ -105,10 +123,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	walker := gitengine.NewHistoryWalker(repo, reader, cfg, pathFilter)
 
 	var occurrences []model.BlobOccurrence
-	err = walker.Walk(func(occ model.BlobOccurrence) error {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
+	err = walker.Walk(ctx, func(occ model.BlobOccurrence) error {
 		occurrences = append(occurrences, occ)
 		return nil
 	})
@@ -129,35 +144,12 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 
 	searchPipeline := search.NewPipeline(reader, matcher, cfg)
 
-	type chanExecutor interface {
-		ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) (<-chan *search.BlobResult, <-chan error)
-	}
-	type sliceExecutor interface {
-		ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) ([]*search.BlobResult, error)
-	}
-
 	var results []*search.BlobResult
-	if che, ok := any(searchPipeline).(chanExecutor); ok {
-		resultsCh, errCh := che.ExecuteContext(ctx, occurrences)
-		for res := range resultsCh {
-			results = append(results, res)
-		}
-		if err = <-errCh; err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return cancelError{err: err, quiet: cfg.Quiet}
-			}
-			return err
-		}
-	} else if se, ok := any(searchPipeline).(sliceExecutor); ok {
-		results, err = se.ExecuteContext(ctx, occurrences)
-	} else {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return cancelError{err: ctxErr, quiet: cfg.Quiet}
-		}
-		results, err = searchPipeline.Execute(occurrences)
+	resultsCh, errCh := searchPipeline.ExecuteContext(ctx, occurrences)
+	for res := range resultsCh {
+		results = append(results, res)
 	}
-
-	if err != nil {
+	if err = <-errCh; err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			return cancelError{err: err, quiet: cfg.Quiet}
 		}
@@ -210,12 +202,13 @@ func emitResults(ctx context.Context, cfg *model.Config, results []*search.BlobR
 		return noMatchError{}
 	}
 
-	if err := ctx.Err(); err != nil {
-		return cancelError{err: err, quiet: cfg.Quiet}
-	}
-
+	// Rendering is cancellable: Format observes ctx at coarse boundaries, so the
+	// pre-flight check is folded into the render itself.
 	formatter := output.NewFormatter(cfg)
-	if err := formatter.Format(stdout, aggregated); err != nil {
+	if err := formatter.Format(ctx, stdout, aggregated); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return cancelError{err: err, quiet: cfg.Quiet}
+		}
 		return err
 	}
 

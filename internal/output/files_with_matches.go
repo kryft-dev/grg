@@ -1,6 +1,7 @@
 package output
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -23,16 +24,22 @@ func NewFilesWithMatchesFormatter(cfg *model.Config) *FilesWithMatchesFormatter 
 	}
 }
 
-// Format writes distinct <commit-short>:<path> lines to w.
-func (f *FilesWithMatchesFormatter) Format(w io.Writer, results *aggregator.AggregatedResults) error {
+// Format writes distinct <commit-short>:<path> lines to w, aborting with
+// ctx.Err() if ctx is cancelled mid-render.
+func (f *FilesWithMatchesFormatter) Format(ctx context.Context, w io.Writer, results *aggregator.AggregatedResults) error {
 	if results == nil || len(results.Files) == 0 {
 		return nil
 	}
 
 	c := f.color
+	guard := newCancelGuard(ctx)
 	seen := make(map[string]bool)
 
 	for _, file := range results.Files {
+		if err := guard.boundary(); err != nil {
+			return err
+		}
+
 		for _, commit := range file.Commits {
 			if len(commit.Matches) == 0 && !commit.IsBinary {
 				continue
@@ -54,6 +61,9 @@ func (f *FilesWithMatchesFormatter) Format(w io.Writer, results *aggregator.Aggr
 			formattedPath := c.Path(file.Path)
 
 			if _, err := fmt.Fprintf(w, "%s%s%s\n", formattedCommit, formattedSep, formattedPath); err != nil {
+				return err
+			}
+			if err := guard.lines(1); err != nil {
 				return err
 			}
 		}

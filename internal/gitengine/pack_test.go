@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ type testPackObj struct {
 	raw     []byte // uncompressed payload for regular objects or delta instructions
 	isOfs   bool
 	baseOff int64
+	baseSHA [20]byte // base object SHA, written for TypeRefDelta objects
 }
 
 func buildTestPackAndIdx(objects []testPackObj) (packData []byte, idxData []byte) {
@@ -76,6 +78,10 @@ func buildTestPackAndIdx(objects []testPackObj) (packData []byte, idxData []byte
 			}
 		}
 
+		if obj.objType == TypeRefDelta {
+			packBuf.Write(obj.baseSHA[:])
+		}
+
 		// Write zlib compressed payload
 		zw := zlib.NewWriter(&packBuf)
 		_, _ = zw.Write(obj.raw)
@@ -103,7 +109,7 @@ func buildTestPackAndIdx(objects []testPackObj) (packData []byte, idxData []byte
 	})
 
 	var idxBuf bytes.Buffer
-	idxBuf.Write(idxV2Magic)
+	idxBuf.WriteString(idxV2Magic)
 	_ = binary.Write(&idxBuf, binary.BigEndian, uint32(2))
 
 	// Fanout table
@@ -258,5 +264,93 @@ func TestPackReaderAndOfsDelta(t *testing.T) {
 	}
 	if !bytes.Equal(objFromRepo.Data, targetContent) {
 		t.Errorf("repoReader returned wrong data: %q", objFromRepo.Data)
+	}
+}
+
+// writeTestPack writes objs as pack-<name>.{pack,idx} into a fresh temporary git
+// object store and returns the common git dir, ready for NewRepositoryReader.
+func writeTestPack(t *testing.T, name string, objs []testPackObj) string {
+	t.Helper()
+
+	packData, idxData := buildTestPackAndIdx(objs)
+
+	gitDir := t.TempDir()
+	packDir := filepath.Join(gitDir, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("failed to create pack dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "pack-"+name+".pack"), packData, 0o644); err != nil {
+		t.Fatalf("failed to write pack: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "pack-"+name+".idx"), idxData, 0o644); err != nil {
+		t.Fatalf("failed to write idx: %v", err)
+	}
+	return gitDir
+}
+
+// blobObject returns a pack object entry for content plus its Git blob OID.
+func blobObject(content []byte) (testPackObj, [20]byte) {
+	header := []byte(fmt.Sprintf("blob %d\x00", len(content)))
+	sha := sha1.Sum(append(header, content...))
+	return testPackObj{sha: sha, objType: TypeBlob, raw: content}, sha
+}
+
+func TestPackReaderRefDelta(t *testing.T) {
+	baseContent := []byte("ref delta base payload")
+	targetContent := []byte("ref delta base payload!!")
+
+	baseObjEntry, baseSHA := blobObject(baseContent)
+
+	targetHeader := []byte(fmt.Sprintf("blob %d\x00", len(targetContent)))
+	targetSHA := sha1.Sum(append(targetHeader, targetContent...))
+
+	var delta []byte
+	delta = append(delta, encodeLEB128(len(baseContent))...)
+	delta = append(delta, encodeLEB128(len(targetContent))...)
+	// Copy all of base: 1 offset byte, 1 size byte
+	delta = append(delta, 0x80|0x01|0x10, 0, byte(len(baseContent)))
+	// Insert the two trailing bytes
+	delta = append(delta, 2, '!', '!')
+
+	objs := []testPackObj{
+		baseObjEntry,
+		{sha: targetSHA, objType: TypeRefDelta, raw: delta, baseSHA: baseSHA},
+	}
+	gitDir := writeTestPack(t, "refdelta", objs)
+	targetOID := hex.EncodeToString(targetSHA[:])
+
+	// 1. Through a RepositoryReader, which wires itself in as the pack's resolver.
+	repoReader, err := NewRepositoryReader(&RepoInfo{CommonGitDir: gitDir})
+	if err != nil {
+		t.Fatalf("NewRepositoryReader failed: %v", err)
+	}
+	defer func() { _ = repoReader.Close() }()
+
+	obj, err := repoReader.ReadObject(targetOID)
+	if err != nil {
+		t.Fatalf("ReadObject(ref_delta) via RepositoryReader failed: %v", err)
+	}
+	if obj.Type != TypeBlob {
+		t.Errorf("expected TypeBlob, got %v", obj.Type)
+	}
+	if !bytes.Equal(obj.Data, targetContent) {
+		t.Errorf("expected %q, got %q", targetContent, obj.Data)
+	}
+
+	// 2. Directly through the PackReader, which has no resolver and must fall back
+	//    to looking the base up in its own index.
+	packDir := filepath.Join(gitDir, "objects", "pack")
+	pr, err := OpenPackfile(filepath.Join(packDir, "pack-refdelta.pack"), filepath.Join(packDir, "pack-refdelta.idx"))
+	if err != nil {
+		t.Fatalf("OpenPackfile failed: %v", err)
+	}
+	defer func() { _ = pr.Close() }()
+
+	direct, err := pr.ReadObject(targetOID)
+	if err != nil {
+		t.Fatalf("ReadObject(ref_delta) via PackReader failed: %v", err)
+	}
+	if !bytes.Equal(direct.Data, targetContent) {
+		t.Errorf("expected %q, got %q", targetContent, direct.Data)
 	}
 }

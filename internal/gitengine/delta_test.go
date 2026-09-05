@@ -70,7 +70,7 @@ func TestApplyDelta(t *testing.T) {
 
 	// Test 3: Pooled buffer decoding
 	buf := make([]byte, 0, 256)
-	res3, err := ApplyDeltaWithBuffer(buf, base, delta2)
+	res3, err := ApplyDeltaWithBuffer(&buf, base, delta2)
 	if err != nil {
 		t.Fatalf("ApplyDeltaWithBuffer failed: %v", err)
 	}

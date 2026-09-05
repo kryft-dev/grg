@@ -207,7 +207,7 @@ func BenchmarkDeltaDecompression(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		target, err := gitengine.ApplyDeltaWithBuffer(buf, base, fullDelta)
+		target, err := gitengine.ApplyDeltaWithBuffer(&buf, base, fullDelta)
 		if err != nil {
 			b.Fatalf("ApplyDeltaWithBuffer failed: %v", err)
 		}

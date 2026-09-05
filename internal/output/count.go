@@ -1,6 +1,7 @@
 package output
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strconv"
@@ -24,14 +25,20 @@ func NewCountFormatter(cfg *model.Config) *CountFormatter {
 	}
 }
 
-// Format writes <commit-short>:<path>:<count> lines to w.
-func (f *CountFormatter) Format(w io.Writer, results *aggregator.AggregatedResults) error {
+// Format writes <commit-short>:<path>:<count> lines to w, aborting with
+// ctx.Err() if ctx is cancelled mid-render.
+func (f *CountFormatter) Format(ctx context.Context, w io.Writer, results *aggregator.AggregatedResults) error {
 	if results == nil || len(results.Files) == 0 {
 		return nil
 	}
 
 	c := f.color
+	guard := newCancelGuard(ctx)
 	for _, file := range results.Files {
+		if err := guard.boundary(); err != nil {
+			return err
+		}
+
 		for _, commit := range file.Commits {
 			count := len(commit.Matches)
 			if commit.IsBinary {
@@ -55,6 +62,9 @@ func (f *CountFormatter) Format(w io.Writer, results *aggregator.AggregatedResul
 				formattedCommit, formattedSep,
 				formattedPath, formattedSep,
 				formattedCount); err != nil {
+				return err
+			}
+			if err := guard.lines(1); err != nil {
 				return err
 			}
 		}

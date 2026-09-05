@@ -50,3 +50,47 @@ func TestTypeMatcher(t *testing.T) {
 		t.Errorf("expected at least 20 supported types, got %d", len(types))
 	}
 }
+
+func TestLookupTypeReturnsCopy(t *testing.T) {
+	def, ok := LookupType("docker")
+	if !ok {
+		t.Fatal("expected docker to be a known type")
+	}
+	if len(def.Extensions) == 0 || len(def.Filenames) == 0 {
+		t.Fatalf("docker definition should carry extensions and filenames, got %+v", def)
+	}
+
+	wantExt := def.Extensions[0]
+	wantName := def.Filenames[0]
+
+	// A caller mutating the returned slices must not corrupt the builtin table.
+	def.Extensions[0] = ".corrupted"
+	def.Filenames[0] = "Corrupted"
+
+	again, ok := LookupType("docker")
+	if !ok {
+		t.Fatal("docker disappeared from the builtin table")
+	}
+	if again.Extensions[0] != wantExt {
+		t.Errorf("Extensions mutation leaked: got %q, want %q", again.Extensions[0], wantExt)
+	}
+	if again.Filenames[0] != wantName {
+		t.Errorf("Filenames mutation leaked: got %q, want %q", again.Filenames[0], wantName)
+	}
+
+	// Matching must still work after the mutation attempt.
+	tm, err := NewTypeMatcher([]string{"docker"})
+	if err != nil {
+		t.Fatalf("NewTypeMatcher failed: %v", err)
+	}
+	if !tm.Match("Dockerfile") {
+		t.Error("Dockerfile stopped matching after a caller mutated a LookupType result")
+	}
+	if !tm.Match("my.dockerfile") {
+		t.Error("my.dockerfile stopped matching after a caller mutated a LookupType result")
+	}
+
+	if _, ok := LookupType("nonexistenttype"); ok {
+		t.Error("expected LookupType to report an unknown type as missing")
+	}
+}

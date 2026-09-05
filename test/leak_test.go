@@ -379,7 +379,7 @@ func TestGoroutineLeak_EndToEndLifecycle(t *testing.T) {
 
 	walker := gitengine.NewHistoryWalker(repoInfo, repoReader, cfg, nil)
 	var occurrences []model.BlobOccurrence
-	err = walker.Walk(func(occ model.BlobOccurrence) error {
+	err = walker.Walk(context.Background(), func(occ model.BlobOccurrence) error {
 		occurrences = append(occurrences, occ)
 		return nil
 	})
@@ -402,7 +402,7 @@ func TestGoroutineLeak_EndToEndLifecycle(t *testing.T) {
 
 	var outBuf bytes.Buffer
 	formatter := output.NewFormatter(cfg)
-	if err := formatter.Format(&outBuf, aggregated); err != nil {
+	if err := formatter.Format(context.Background(), &outBuf, aggregated); err != nil {
 		t.Fatalf("formatter.Format failed: %v", err)
 	}
 
