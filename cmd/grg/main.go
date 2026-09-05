@@ -168,7 +168,33 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return cancelError{err: err, quiet: cfg.Quiet}
 	}
 
-	if len(results) == 0 {
+	// Warn about unreadable blobs before any match output so stdout stays clean.
+	skipped := reportSkippedBlobs(stderr, results)
+
+	return withSkippedBlobs(emitResults(ctx, cfg, results, stdout), skipped, cfg.Quiet)
+}
+
+// reportSkippedBlobs writes one warning line per blob the pipeline could not read
+// and returns how many were skipped.
+func reportSkippedBlobs(stderr io.Writer, results []*search.BlobResult) int {
+	skipped := 0
+	for _, res := range results {
+		if res == nil {
+			continue
+		}
+		var bre *search.BlobReadError
+		if errors.As(res.Error, &bre) {
+			skipped++
+			fmt.Fprintf(stderr, "grg: warning: skipping blob %s (%s): %v\n", bre.OID, bre.Path, bre.Err)
+		}
+	}
+	return skipped
+}
+
+// emitResults aggregates and renders the search results, returning noMatchError
+// when nothing matched. Under --quiet nothing is written to stdout.
+func emitResults(ctx context.Context, cfg *model.Config, results []*search.BlobResult, stdout io.Writer) error {
+	if !hasMatches(results) {
 		return noMatchError{}
 	}
 
@@ -194,6 +220,17 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 
 	return nil
+}
+
+// hasMatches reports whether any result carries a text or binary match.
+// Results for skipped blobs carry only an error and do not count.
+func hasMatches(results []*search.BlobResult) bool {
+	for _, res := range results {
+		if res != nil && (len(res.Matches) > 0 || res.IsBinary) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildPathFilter(repo *gitengine.RepoInfo, cfg *model.Config) (func(path string) bool, error) {

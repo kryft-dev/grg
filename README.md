@@ -241,11 +241,10 @@ grg --expand-commits "constant_value"
 1. **Target Medium:** `rg` searches working directory files on the filesystem. `grg` searches Git objects (`.git/objects/pack/` and loose objects) across commit history without touching the filesystem working tree.
 2. **Attribution:** Matches in `grg` include commit provenance (commit SHA, date, author, summary), and repeated identical blobs are deduplicated by default.
 3. **Filesystem Flags Excluded:** Flags specific to directory traversal (such as `--follow` for symlinks, `--max-depth`, `--hidden`, `.gitignore` filtering) are omitted because `grg` traverses Git tree structures directly.
-4. **Exit Codes:**
-   - `0`: Match found.
-   - `1`: No match found.
-   - `2`: CLI argument or regex syntax error.
-   - `128`: Repository discovery or Git object read error.
+4. **Exit Codes** (ripgrep semantics):
+   - `0`: Match found and no error occurred (or `-q` found a match).
+   - `1`: No match found and no error occurred.
+   - `2`: An error occurred. This covers fatal errors (CLI argument or regex syntax error, repository discovery failure, cancellation) and soft errors: a blob that cannot be read (missing or corrupt object) is skipped with a `grg: warning: skipping blob <oid> (<path>): ...` line on stderr, the search continues and still prints matches from every other blob, and the exit code is 2.
 
 ---
 

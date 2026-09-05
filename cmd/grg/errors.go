@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // Exit-code error types. Every error returned from runContext is mapped to a process
@@ -81,6 +82,45 @@ func (n noMatchError) Error() string {
 
 func (n noMatchError) ExitCode() int {
 	return 1
+}
+
+// skippedBlobsError records that one or more blobs could not be read and were
+// skipped. It follows ripgrep's soft-error semantics: matches (if any) were still
+// printed, but the exit code is 2. Each skipped blob was already reported on
+// stderr as a warning, so main prints no additional message for this error.
+type skippedBlobsError struct {
+	count int
+}
+
+func (s skippedBlobsError) Error() string {
+	return fmt.Sprintf("skipped %d unreadable blob(s)", s.count)
+}
+
+func (s skippedBlobsError) ExitCode() int {
+	return 2
+}
+
+func (s skippedBlobsError) IsQuiet() bool {
+	return true
+}
+
+// withSkippedBlobs folds the number of skipped blobs into the search outcome.
+// Fatal errors take precedence. Otherwise any skipped blob forces exit code 2,
+// except that --quiet with a match found still exits 0 (ripgrep semantics).
+func withSkippedBlobs(err error, skipped int, quiet bool) error {
+	if skipped == 0 {
+		return err
+	}
+	if err == nil {
+		if quiet {
+			return nil
+		}
+		return skippedBlobsError{count: skipped}
+	}
+	if errors.Is(err, noMatchError{}) {
+		return skippedBlobsError{count: skipped}
+	}
+	return err
 }
 
 func isQuietError(err error) bool {

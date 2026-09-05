@@ -442,4 +442,3 @@ func TestRun_SEC03_SubdirectoryPathAnchoring(t *testing.T) {
 		t.Errorf("expected match in output when anchored relative to worktree, got: %s", buf.String())
 	}
 }
-

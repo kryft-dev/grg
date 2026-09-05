@@ -2,6 +2,7 @@ package aggregator
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 
@@ -122,6 +123,12 @@ func (a *Aggregator) AggregateChannel(ctx context.Context, resultsCh <-chan *sea
 			}
 			if res != nil {
 				if res.Error != nil {
+					// A blob the pipeline could not read is a soft failure: it carries no
+					// matches and is skipped so the remaining blobs still aggregate.
+					var bre *search.BlobReadError
+					if errors.As(res.Error, &bre) {
+						continue
+					}
 					return nil, res.Error
 				}
 				a.processBlobResult(res, fileMap, &fileOrder)
