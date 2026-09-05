@@ -86,7 +86,7 @@ func TestSafety_Delta_Uint32Overflow(t *testing.T) {
 	copyInstr := []byte{
 		0x80 | 0x01 | 0x02 | 0x04 | 0x08 | 0x10, // copy with 4 offset bytes and 1 size byte
 		0xff, 0xff, 0xff, 0xff,                  // offset: 0xFFFFFFFF
-		0x01,                                    // size: 1
+		0x01, // size: 1
 	}
 
 	payload := append(deltaHdr, copyInstr...)

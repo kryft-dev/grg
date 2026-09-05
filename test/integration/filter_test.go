@@ -160,10 +160,10 @@ func TestFilter_Type(t *testing.T) {
 	repo := NewTestRepo(t)
 
 	repo.Commit("Add multi-type tree", map[string]string{
-		"server.go":    "TYPE_FILTER_PAYLOAD\n",
-		"README.md":    "TYPE_FILTER_PAYLOAD\n",
-		"config.json":  "TYPE_FILTER_PAYLOAD\n",
-		"style.css":    "TYPE_FILTER_PAYLOAD\n",
+		"server.go":   "TYPE_FILTER_PAYLOAD\n",
+		"README.md":   "TYPE_FILTER_PAYLOAD\n",
+		"config.json": "TYPE_FILTER_PAYLOAD\n",
+		"style.css":   "TYPE_FILTER_PAYLOAD\n",
 	})
 
 	// Type go

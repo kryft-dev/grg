@@ -349,4 +349,3 @@ func ParseArgs(args []string) (*model.Config, error) {
 
 	return cfg, nil
 }
-

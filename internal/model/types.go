@@ -28,10 +28,10 @@ type CommitMetadata struct {
 // BlobOccurrence represents a specific blob appearing at a file path within a commit.
 // Captures the provenance of a blob occurrence in repository history.
 type BlobOccurrence struct {
-	BlobOID    string    // Cryptographic object identifier of the Git blob
-	Path       string    // Repository-relative file path
-	CommitSHA  string    // Commit where this blob was introduced or observed
-	CommitDate time.Time // Commit timestamp
+	BlobOID       string          // Cryptographic object identifier of the Git blob
+	Path          string          // Repository-relative file path
+	CommitSHA     string          // Commit where this blob was introduced or observed
+	CommitDate    time.Time       // Commit timestamp
 	Mode          uint32          // Git file mode (e.g. 0100644, 0100755)
 	CommitSummary string          // First line of commit message
 	CommitAuthor  string          // Commit author name or string

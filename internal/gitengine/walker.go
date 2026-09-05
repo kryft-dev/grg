@@ -411,4 +411,3 @@ func (w *HistoryWalker) traverseExclude(startSHA string, excluded map[string]boo
 		}
 	}
 }
-

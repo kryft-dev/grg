@@ -1,5 +1,5 @@
 # Compiled binaries
-grg
+/grg
 *.exe
 *.exe~
 *.dll

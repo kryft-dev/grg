@@ -25,7 +25,7 @@ type TreeEntry struct {
 
 // IsTree returns true if this entry is a subtree (directory).
 func (e TreeEntry) IsTree() bool {
-	return (e.Mode & 0170000) == 0040000 || e.Mode == 0040000
+	return (e.Mode&0170000) == 0040000 || e.Mode == 0040000
 }
 
 // IsBlob returns true if this entry is a regular file or executable.

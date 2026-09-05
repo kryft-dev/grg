@@ -177,10 +177,10 @@ func FuzzGitDeltaApply(f *testing.F) {
 	base := []byte("hello world baseline text for delta testing\n")
 	// Delta header: baseSize=44 (0x2c), targetSize=48 (0x30), insert 4 bytes "1234"
 	var validDelta []byte
-	validDelta = append(validDelta, 0x2c)                        // baseSize LEB128
-	validDelta = append(validDelta, 0x30)                        // targetSize LEB128
-	validDelta = append(validDelta, 0x90, 0x00, 0x2c)            // Copy opcode: offset 0, size 44
-	validDelta = append(validDelta, 0x04, '1', '2', '3', '4')    // Insert opcode: 4 bytes
+	validDelta = append(validDelta, 0x2c)                     // baseSize LEB128
+	validDelta = append(validDelta, 0x30)                     // targetSize LEB128
+	validDelta = append(validDelta, 0x90, 0x00, 0x2c)         // Copy opcode: offset 0, size 44
+	validDelta = append(validDelta, 0x04, '1', '2', '3', '4') // Insert opcode: 4 bytes
 
 	f.Add(base, validDelta)
 	f.Add(base, []byte{})

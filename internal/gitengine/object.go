@@ -183,4 +183,3 @@ func (r *RepositoryReader) Close() error {
 	r.packs = nil
 	return firstErr
 }
-

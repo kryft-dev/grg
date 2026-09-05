@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	benchGRGBin     string
+	benchGRGBin      string
 	benchGRGBuildErr error
 	benchGRGOnce     sync.Once
 )
