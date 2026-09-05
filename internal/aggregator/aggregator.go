@@ -90,54 +90,90 @@ func (a *Aggregator) Aggregate(results []*search.BlobResult) *AggregatedResults 
 }
 
 // AggregateChannel organizes streamed BlobResult items into structured, ordered FileMatches.
-// It terminates cleanly when resultsCh is closed, an error is received on errCh, or ctx is cancelled.
-func (a *Aggregator) AggregateChannel(ctx context.Context, resultsCh <-chan *search.BlobResult, errCh <-chan error) (*AggregatedResults, error) {
+//
+// It consumes resultsCh and errCh until both are closed and then returns the aggregated
+// results. It returns early, with a nil result, when errCh yields a non-nil error, when a
+// result carries a fatal error, or when ctx is cancelled.
+//
+// The producer owns both channels and must close both when it stops. It may publish its
+// terminal error before or after closing resultsCh: aggregation finalizes only once errCh
+// is closed, so a late error is still surfaced rather than silently dropped.
+//
+// The caller must pass a context that the producer also observes, and that is cancelled
+// when the caller loses interest. On every early return this function drains resultsCh so
+// the producer is never left blocked on a send, and that drain only terminates once the
+// producer closes resultsCh; a shared cancellable context is what guarantees the producer
+// gets there.
+func (a *Aggregator) AggregateChannel(ctx context.Context, resultsCh <-chan *search.BlobResult, errCh <-chan error) (out *AggregatedResults, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
+	// Every early return below walks away from a producer that is still sending. Producers
+	// use a bounded results channel, so once its buffer fills every worker blocks on its
+	// send, the task dispatcher blocks behind them, and the object store they pin is never
+	// released - the producer wedges permanently and never closes its channels. Draining
+	// hands the producer the receives it is waiting for so it can run itself down.
+	//
+	// Termination: a nil resultsCh means the loop below already observed the close and
+	// consumed the channel to completion, so there is nothing left to unblock - and
+	// ranging over a nil channel would block forever, so return instead. Otherwise every
+	// receive advances the producer, so the drain ends as soon as the producer closes
+	// resultsCh. A producer honouring the contract above always gets there, whether it
+	// finishes its work or unwinds because the shared context was cancelled.
+	defer func() {
+		if resultsCh == nil || (err == nil && ctx.Err() == nil) {
+			return
+		}
+		for range resultsCh {
+		}
+	}()
+
 	var fileOrder []string
 	fileMap := make(map[string]*fileBuilder)
 
-	for {
+	// A receive on a closed channel is ready forever, so an exhausted arm must be disabled
+	// by nilling its channel: a nil channel is never ready and its arm is never chosen
+	// again. Leaving a closed channel in place would make the select spin on it at full
+	// CPU. Both channels closed means the producer is done and the results are complete.
+	for resultsCh != nil || errCh != nil {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case err, ok := <-errCh:
-			if ok && err != nil {
-				return nil, err
+		case perr, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				continue
+			}
+			if perr != nil {
+				return nil, perr
 			}
 		case res, ok := <-resultsCh:
 			if !ok {
-				// Channel closed: verify if any pending error remains on errCh
-				if errCh != nil {
-					select {
-					case err, ok := <-errCh:
-						if ok && err != nil {
-							return nil, err
-						}
-					default:
-					}
-				}
-				return a.finalizeResults(fileMap, fileOrder), nil
+				resultsCh = nil
+				continue
 			}
-			if res != nil {
-				if res.Error != nil {
-					// A blob the pipeline could not read is a soft failure: it carries no
-					// matches and is skipped so the remaining blobs still aggregate.
-					var bre *search.BlobReadError
-					if errors.As(res.Error, &bre) {
-						continue
-					}
-					return nil, res.Error
-				}
-				a.processBlobResult(res, fileMap, &fileOrder)
+			if res == nil {
+				continue
 			}
+			if res.Error != nil {
+				// A blob the pipeline could not read is a soft failure: it carries no
+				// matches and is skipped so the remaining blobs still aggregate.
+				var bre *search.BlobReadError
+				if errors.As(res.Error, &bre) {
+					continue
+				}
+				return nil, res.Error
+			}
+			a.processBlobResult(res, fileMap, &fileOrder)
 		}
 	}
+
+	return a.finalizeResults(fileMap, fileOrder), nil
 }
 
-// AggregateStream is an alias to AggregateChannel for streaming API flexibility.
+// AggregateStream is an alias to AggregateChannel for streaming API flexibility. The
+// producer and caller contracts documented on AggregateChannel apply unchanged.
 func (a *Aggregator) AggregateStream(ctx context.Context, resultsCh <-chan *search.BlobResult, errCh <-chan error) (*AggregatedResults, error) {
 	return a.AggregateChannel(ctx, resultsCh, errCh)
 }
