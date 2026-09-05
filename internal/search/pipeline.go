@@ -53,6 +53,10 @@ func isBlobReadError(err error) bool {
 }
 
 // Pipeline coordinates concurrent blob decompression, search matching, and provenance association.
+//
+// A Pipeline is immutable after construction: its reader, matcher, config, and
+// worker count are never written after NewPipeline returns, so a single
+// Pipeline is safe for concurrent use by multiple goroutines.
 type Pipeline struct {
 	reader  gitengine.ObjectReader
 	matcher *Matcher
@@ -80,8 +84,18 @@ type blobTask struct {
 }
 
 // ExecuteContext executes the search pipeline with context cancellation support,
-// bounded worker pools, channel backpressure, and zero goroutine leaks.
-// It streams results and errors over bounded channels until completion or cancellation.
+// bounded worker pools, and channel backpressure. It streams results and errors
+// over bounded channels until completion or cancellation.
+//
+// The pipeline leaks no goroutines provided the caller either drains resultsCh to
+// completion or cancels ctx: workers block on resultsCh sends and unblock only on
+// a receive or on cancellation. resultsCh is closed once every worker has exited,
+// and errCh is closed immediately after, so a caller may read errCh once the
+// range over resultsCh ends.
+//
+// Work runs under a cancellable child of ctx, so the pipeline stops early on the
+// first fatal error and, in quiet mode, on the first match. Neither is a
+// cancellation error: only cancellation of ctx itself is reported on errCh.
 func (p *Pipeline) ExecuteContext(ctx context.Context, occurrences []model.BlobOccurrence) (<-chan *BlobResult, <-chan error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -130,70 +144,52 @@ func (p *Pipeline) ExecuteContext(ctx context.Context, occurrences []model.BlobO
 
 	tasksCh := make(chan *blobTask, bufSize)
 	resultsCh := make(chan *BlobResult, bufSize)
+	// errCh has capacity 1 and every send on it is non-blocking, which implements
+	// first-fatal-error-wins: the first fatal error is kept and later ones are
+	// dropped. That capacity is exactly what guarantees a worker never blocks
+	// publishing an error, because the consumer usually does not read errCh until
+	// resultsCh has been drained. Raising it "so no error is lost" would let a
+	// worker's error send outlive the consumer's interest and reintroduce that
+	// deadlock.
 	errCh := make(chan error, 1)
 
-	// Dispatcher feeding tasks into bounded tasksCh with ctx cancellation check
-	go func() {
-		defer close(tasksCh)
-		for _, task := range jobOrder {
-			select {
-			case <-ctx.Done():
-				return
-			case tasksCh <- task:
-			}
-		}
-	}()
+	// All work runs under a cancellable child of the caller's context so that the
+	// first fatal error and a quiet-mode match can abandon the remaining blobs at
+	// once. callerCtx is kept for the closer: an internal early stop must never be
+	// reported as a cancellation.
+	callerCtx := ctx
+	ctx, cancelWork := context.WithCancel(callerCtx)
 
-	// Launch worker pool
-	var stop atomic.Bool
+	go p.dispatch(ctx, jobOrder, tasksCh)
+
+	// searched counts tasks whose result was fully delivered. It tells the closer
+	// whether the run actually finished, so a cancellation arriving after the last
+	// result was handed over cannot turn a complete result set into a failure.
+	var searched atomic.Int64
 	var wg sync.WaitGroup
-	for i := 0; i < p.workers; i++ {
+	for range p.workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case task, ok := <-tasksCh:
-					if !ok {
-						return
-					}
-					if stop.Load() {
-						continue
-					}
-					res := p.processTask(ctx, task)
-					// Soft per-blob read failures are delivered on resultsCh only; every
-					// other error is fatal and also reported on errCh.
-					if res.Error != nil && !isBlobReadError(res.Error) {
-						select {
-						case errCh <- res.Error:
-						default:
-						}
-					}
-					if p.cfg.Quiet && (len(res.Matches) > 0 || res.IsBinary) {
-						stop.Store(true)
-					}
-					// Only send results that have matches, are binary, or have errors
-					if len(res.Matches) > 0 || res.IsBinary || res.Error != nil {
-						select {
-						case <-ctx.Done():
-							return
-						case resultsCh <- res:
-						}
-					}
-				}
-			}
+			p.runWorker(ctx, cancelWork, &searched, tasksCh, resultsCh, errCh)
 		}()
 	}
 
-	// Closer goroutine waits for all workers to exit, captures cancellation error, and closes channels
+	// The closer is the sole owner of resultsCh and errCh: it waits for every
+	// worker to exit, publishes a caller-side cancellation, and closes both. The
+	// publication is gated on callerCtx, never on the derived ctx, because a quiet
+	// early stop or a fatal error cancels the derived one and must not surface as
+	// context.Canceled. It is gated on searched as well, because a caller who
+	// received every result was not cut short, whenever the cancel arrived.
 	go func() {
+		defer cancelWork()
 		wg.Wait()
-		if err := ctx.Err(); err != nil {
-			select {
-			case errCh <- err:
-			default:
+		if searched.Load() < int64(len(jobOrder)) {
+			if err := callerCtx.Err(); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
 			}
 		}
 		close(resultsCh)
@@ -201,6 +197,78 @@ func (p *Pipeline) ExecuteContext(ctx context.Context, occurrences []model.BlobO
 	}()
 
 	return resultsCh, errCh
+}
+
+// dispatch feeds every deduplicated task into tasksCh and is its only sender and
+// closer. It abandons the remaining tasks as soon as ctx is cancelled, which is
+// how a quiet-mode match, a fatal error, or a caller cancellation stops the run
+// without draining jobOrder.
+func (p *Pipeline) dispatch(ctx context.Context, jobOrder []*blobTask, tasksCh chan<- *blobTask) {
+	defer close(tasksCh)
+	for _, task := range jobOrder {
+		select {
+		case <-ctx.Done():
+			return
+		case tasksCh <- task:
+		}
+	}
+}
+
+// runWorker searches tasks until tasksCh is drained and closed or ctx is
+// cancelled. It never closes any channel it is given; cancelWork cancels ctx to
+// stop the whole run after the first fatal error and, in quiet mode, after the
+// first match. Every task whose result reaches resultsCh, or that has no result
+// to report, is counted in searched; a task abandoned to cancellation is not.
+func (p *Pipeline) runWorker(
+	ctx context.Context,
+	cancelWork context.CancelFunc,
+	searched *atomic.Int64,
+	tasksCh <-chan *blobTask,
+	resultsCh chan<- *BlobResult,
+	errCh chan<- error,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-tasksCh:
+			if !ok {
+				return
+			}
+			res := p.safeProcessTask(ctx, task)
+			if ctx.Err() != nil {
+				// The run is already being torn down, by the caller or by another
+				// worker. res is redundant, and any error it carries is just that
+				// cancellation, which the closer reports if the caller caused it.
+				return
+			}
+			// Soft per-blob read failures are delivered on resultsCh only; every
+			// other error is fatal: it is reported on errCh and stops the run.
+			fatal := res.Error != nil && !isBlobReadError(res.Error)
+			if fatal {
+				select {
+				case errCh <- res.Error:
+				default:
+				}
+			}
+			// Only send results that have matches, are binary, or have errors
+			if len(res.Matches) > 0 || res.IsBinary || res.Error != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case resultsCh <- res:
+				}
+			}
+			searched.Add(1)
+			// The result is published, so the remaining blobs are now pointless:
+			// -q wants nothing beyond the first hit, and a fatal error abandons the
+			// run. Cancelling unblocks the dispatcher and the other workers.
+			if fatal || (p.cfg.Quiet && (len(res.Matches) > 0 || res.IsBinary)) {
+				cancelWork()
+				return
+			}
+		}
+	}
 }
 
 // Execute provides backwards-compatible synchronous execution by executing with context.Background()
@@ -229,9 +297,24 @@ func (p *Pipeline) Execute(occurrences []model.BlobOccurrence) ([]*BlobResult, e
 	return results, nil
 }
 
-// ExecuteStream streams search results using context.Background().
-func (p *Pipeline) ExecuteStream(occurrences []model.BlobOccurrence) (<-chan *BlobResult, <-chan error) {
-	return p.ExecuteContext(context.Background(), occurrences)
+// safeProcessTask turns a panic in processTask into an ordinary fatal error.
+// processTask drives packfile index lookups, zlib inflate, and delta
+// reconstruction over bytes from an arbitrary .git directory; a panic on a worker
+// goroutine cannot be recovered by the caller and would kill the process, taking
+// the reader's cleanup and the exit-code contract with it. The recover is scoped
+// to a single task so one poisoned blob does not stop the worker from reporting
+// it through the normal fatal-error path.
+func (p *Pipeline) safeProcessTask(ctx context.Context, task *blobTask) (res *BlobResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = &BlobResult{
+				BlobOID:     task.oid,
+				Occurrences: task.occurrences,
+				Error:       fmt.Errorf("panic searching blob %s: %v", task.oid, r),
+			}
+		}
+	}()
+	return p.processTask(ctx, task)
 }
 
 // processTask reads the blob from Git object store and applies binary detection and pattern matching.

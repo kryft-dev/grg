@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -463,5 +465,242 @@ func TestPipelineSkipsUnreadableBlob(t *testing.T) {
 				t.Errorf("skipped blob must contribute no matches, got %d", len(res.Matches))
 			}
 		})
+	}
+}
+
+// countingReader records how many blobs the pipeline actually read, and panics
+// on selected OIDs to stand in for a corrupt object that trips a bug in inflate
+// or delta reconstruction.
+type countingReader struct {
+	*mockSearchReader
+	reads   atomic.Int64
+	panicOn map[string]bool // filled in before ExecuteContext, never written after
+}
+
+func newCountingReader() *countingReader {
+	return &countingReader{
+		mockSearchReader: newMockSearchReader(),
+		panicOn:          make(map[string]bool),
+	}
+}
+
+func (c *countingReader) ReadObject(oid string) (*gitengine.Object, error) {
+	c.reads.Add(1)
+	if c.panicOn[oid] {
+		panic("simulated corrupt object " + oid)
+	}
+	return c.mockSearchReader.ReadObject(oid)
+}
+
+// matchingOccurrences stores n distinct blobs that all match the pattern
+// "needle" and returns one occurrence for each, in blob order.
+func matchingOccurrences(r *countingReader, n int) []model.BlobOccurrence {
+	occurrences := make([]model.BlobOccurrence, 0, n)
+	for i := range n {
+		oid := r.putBlob([]byte(fmt.Sprintf("needle in blob %d\n", i)))
+		occurrences = append(occurrences, model.BlobOccurrence{
+			BlobOID:   oid,
+			Path:      fmt.Sprintf("file_%d.txt", i),
+			CommitSHA: "c1",
+			Mode:      0100644,
+		})
+	}
+	return occurrences
+}
+
+// -q asks for the first hit only. The pipeline must abandon the remaining blobs
+// instead of pulling all of them through the queue, and its early stop must not
+// be reported as a cancellation error.
+func TestPipelineQuietStopsAfterFirstMatch(t *testing.T) {
+	t.Run("single worker reads only the first blob", func(t *testing.T) {
+		reader := newCountingReader()
+		occurrences := matchingOccurrences(reader, 200)
+
+		cfg := &model.Config{Pattern: "needle", Quiet: true}
+		matcher, err := NewMatcher(cfg)
+		if err != nil {
+			t.Fatalf("NewMatcher failed: %v", err)
+		}
+		p := NewPipeline(reader, matcher, cfg)
+		p.workers = 1 // one worker, so the first task alone decides the run
+
+		resultsCh, errCh := p.ExecuteContext(context.Background(), occurrences)
+		var results []*BlobResult
+		for res := range resultsCh {
+			results = append(results, res)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("quiet early stop must not be an error, got %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("got %d results, want 1: -q reports a single hit", len(results))
+		}
+		if got := reader.reads.Load(); got != 1 {
+			t.Errorf("read %d blobs, want exactly 1: -q must stop at the first match", got)
+		}
+	})
+
+	t.Run("concurrent workers stop well before the queue is drained", func(t *testing.T) {
+		reader := newCountingReader()
+		occurrences := matchingOccurrences(reader, 2000)
+
+		cfg := &model.Config{Pattern: "needle", Quiet: true}
+		matcher, err := NewMatcher(cfg)
+		if err != nil {
+			t.Fatalf("NewMatcher failed: %v", err)
+		}
+
+		resultsCh, errCh := NewPipeline(reader, matcher, cfg).ExecuteContext(context.Background(), occurrences)
+		results := 0
+		for range resultsCh {
+			results++
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("quiet early stop must not be an error, got %v", err)
+		}
+		if results == 0 {
+			t.Errorf("expected at least the one hit -q asks for")
+		}
+		// Cancellation bounds the reads to the tasks already buffered or in
+		// flight; without it every one of the 2000 blobs is pulled from the queue.
+		if got, limit := reader.reads.Load(), int64(len(occurrences)/2); got > limit {
+			t.Errorf("read %d of %d blobs, want at most %d: -q must cancel, not drain", got, len(occurrences), limit)
+		}
+	})
+}
+
+// A fatal error abandons the run. The pipeline must stop at once instead of
+// searching every remaining blob and only revealing the failure when resultsCh
+// closes, and the failure it reports must be the error itself, not the
+// cancellation that error triggered.
+func TestPipelineFatalErrorStopsRunEarly(t *testing.T) {
+	reader := newCountingReader()
+	occurrences := matchingOccurrences(reader, 300)
+	reader.panicOn[occurrences[0].BlobOID] = true
+
+	cfg := &model.Config{Pattern: "needle"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	p := NewPipeline(reader, matcher, cfg)
+	p.workers = 1 // one worker, so the failing blob is the first task
+
+	resultsCh, errCh := p.ExecuteContext(context.Background(), occurrences)
+	for range resultsCh {
+	}
+
+	err = <-errCh
+	if err == nil {
+		t.Fatalf("a fatal error must be reported on errCh")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("stopping the run must not mask the fatal error as a cancellation: %v", err)
+	}
+	if got := reader.reads.Load(); got != 1 {
+		t.Errorf("read %d of %d blobs, want exactly 1: a fatal error must stop the run", got, len(occurrences))
+	}
+}
+
+// The pipeline inflates and reconstructs bytes from an arbitrary .git
+// directory, so a panic must become an ordinary fatal error naming the offending
+// blob instead of killing the process (here, the test binary) and skipping every
+// deferred cleanup and the exit-code contract.
+func TestPipelinePanicBecomesFatalError(t *testing.T) {
+	reader := newCountingReader()
+	good := reader.putBlob([]byte("needle in a readable blob\n"))
+	poison := reader.putBlob([]byte("needle in a poisoned blob\n"))
+	reader.panicOn[poison] = true
+
+	occurrences := []model.BlobOccurrence{
+		{BlobOID: good, Path: "good.txt", CommitSHA: "c1", Mode: 0100644},
+		{BlobOID: poison, Path: "poison.txt", CommitSHA: "c1", Mode: 0100644},
+	}
+
+	cfg := &model.Config{Pattern: "needle"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	p := NewPipeline(reader, matcher, cfg)
+	p.workers = 1 // one worker, so the readable blob is searched before the panic
+
+	resultsCh, errCh := p.ExecuteContext(context.Background(), occurrences)
+	byOID := make(map[string]*BlobResult, len(occurrences))
+	for res := range resultsCh {
+		byOID[res.BlobOID] = res
+	}
+
+	err = <-errCh
+	if err == nil {
+		t.Fatalf("a panicking blob must surface as a fatal error on errCh")
+	}
+	if !strings.Contains(err.Error(), poison) {
+		t.Errorf("fatal error must name the offending blob %s, got: %v", poison, err)
+	}
+
+	res, ok := byOID[poison]
+	if !ok {
+		t.Fatalf("expected a result carrying the panic for %s", poison)
+	}
+	if res.Error == nil || !strings.Contains(res.Error.Error(), "panic") {
+		t.Errorf("result for the poisoned blob must carry the recovered panic, got %v", res.Error)
+	}
+	if isBlobReadError(res.Error) {
+		t.Errorf("a panic is fatal, not a soft per-blob read failure: %v", res.Error)
+	}
+
+	res, ok = byOID[good]
+	if !ok {
+		t.Fatalf("the blob searched before the panic must still be delivered")
+	}
+	if len(res.Matches) != 1 {
+		t.Errorf("got %d matches for the readable blob, want 1", len(res.Matches))
+	}
+}
+
+// A cancellation arriving once every result has been handed to the caller must
+// not turn a complete run into a failure: nothing was cut short, so exit codes
+// derived from errCh must stay clean even if the signal lands microseconds after
+// the last worker finished.
+func TestPipelineCancelAfterCompletion(t *testing.T) {
+	reader := newCountingReader()
+	occurrences := matchingOccurrences(reader, 64)
+
+	cfg := &model.Config{Pattern: "needle"}
+	matcher, err := NewMatcher(cfg)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	p := NewPipeline(reader, matcher, cfg)
+
+	// Repeat so the cancel lands at varying points of the shutdown sequence.
+	for range 30 {
+		func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			resultsCh, errCh := p.ExecuteContext(ctx, occurrences)
+
+			// Take every expected result, then cancel while the workers and the
+			// closer may still be winding down.
+			for got := 0; got < len(occurrences); got++ {
+				res, ok := <-resultsCh
+				if !ok {
+					t.Fatalf("resultsCh closed after %d of %d results", got, len(occurrences))
+				}
+				if res.Error != nil {
+					t.Fatalf("unexpected result error: %v", res.Error)
+				}
+			}
+			cancel()
+
+			for range resultsCh {
+				t.Errorf("got more results than the %d blobs searched", len(occurrences))
+			}
+			if err := <-errCh; err != nil {
+				t.Fatalf("cancel after the full result set must leave errCh empty, got %v", err)
+			}
+		}()
 	}
 }
