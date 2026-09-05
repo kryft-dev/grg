@@ -1,6 +1,7 @@
 package output
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strconv"
@@ -24,14 +25,20 @@ func NewSingleLineFormatter(cfg *model.Config) *SingleLineFormatter {
 	}
 }
 
-// Format writes single-line matches to w.
-func (s *SingleLineFormatter) Format(w io.Writer, results *aggregator.AggregatedResults) error {
+// Format writes single-line matches to w, aborting with ctx.Err() if ctx is
+// cancelled mid-render.
+func (s *SingleLineFormatter) Format(ctx context.Context, w io.Writer, results *aggregator.AggregatedResults) error {
 	if results == nil || len(results.Files) == 0 {
 		return nil
 	}
 
 	c := s.color
+	guard := newCancelGuard(ctx)
 	for _, file := range results.Files {
+		if err := guard.boundary(); err != nil {
+			return err
+		}
+
 		for _, commit := range file.Commits {
 			shortSHA := commit.ShortSHA
 			if shortSHA == "" {
@@ -56,11 +63,17 @@ func (s *SingleLineFormatter) Format(w io.Writer, results *aggregator.Aggregated
 						if err := s.writeEntry(w, shortSHA, file.Path, line.LineNum, line.LineText, line.IsMatch, line.Submatches); err != nil {
 							return err
 						}
+						if err := guard.lines(1); err != nil {
+							return err
+						}
 					}
 				}
 			} else {
 				for _, match := range commit.Matches {
 					if err := s.writeEntry(w, shortSHA, file.Path, match.LineNum, match.LineText, true, match.Submatches); err != nil {
+						return err
+					}
+					if err := guard.lines(1); err != nil {
 						return err
 					}
 				}

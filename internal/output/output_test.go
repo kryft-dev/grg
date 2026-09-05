@@ -2,6 +2,9 @@ package output
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +63,7 @@ func TestGroupedFormatter(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -84,7 +87,7 @@ func TestGroupedFormatter_NoLineNumber(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -140,7 +143,7 @@ func TestGroupedFormatter_ContextLines(t *testing.T) {
 	fmtter := NewFormatter(cfg)
 
 	var buf bytes.Buffer
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -167,7 +170,7 @@ func TestSingleLineFormatter(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -189,7 +192,7 @@ func TestSingleLineFormatter_NoLineNumber(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -210,7 +213,7 @@ func TestFilesWithMatchesFormatter(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -229,7 +232,7 @@ func TestCountFormatter(t *testing.T) {
 
 	var buf bytes.Buffer
 	results := makeTestAggregatedResults()
-	if err := fmtter.Format(&buf, results); err != nil {
+	if err := fmtter.Format(context.Background(), &buf, results); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -270,7 +273,7 @@ func TestBinaryFormatter(t *testing.T) {
 		Color:   model.ColorNever,
 	}
 	var buf bytes.Buffer
-	if err := NewFormatter(cfg).Format(&buf, results); err != nil {
+	if err := NewFormatter(cfg).Format(context.Background(), &buf, results); err != nil {
 		t.Fatal(err)
 	}
 
@@ -318,5 +321,135 @@ func TestColorHighlighting(t *testing.T) {
 	expected := BoldRed + "hello" + Reset + " world"
 	if highlighted != expected {
 		t.Errorf("expected %q, got %q", expected, highlighted)
+	}
+}
+
+// makeLargeAggregatedResults builds a result set whose rendering spans several
+// cancelCheckInterval windows, so that a mid-render cancellation is observable.
+func makeLargeAggregatedResults(files, matchesPerFile int) *aggregator.AggregatedResults {
+	date := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	res := &aggregator.AggregatedResults{TotalFiles: files}
+	for f := range files {
+		matches := make([]model.SearchMatch, matchesPerFile)
+		for m := range matches {
+			matches[m] = model.SearchMatch{
+				LineNum:  m + 1,
+				LineText: fmt.Sprintf("needle in file %d line %d", f, m+1),
+			}
+		}
+		res.Files = append(res.Files, aggregator.FileMatches{
+			Path: fmt.Sprintf("pkg/file%04d.go", f),
+			Commits: []aggregator.CommitMatches{{
+				CommitSHA:  fmt.Sprintf("%040x", f),
+				ShortSHA:   fmt.Sprintf("%07x", f),
+				CommitDate: date,
+				Author:     "Alice",
+				AuthorName: "Alice",
+				Summary:    "bulk commit",
+				Matches:    matches,
+			}},
+		})
+		res.TotalMatches += matchesPerFile
+	}
+	return res
+}
+
+// cancelAfterWriter cancels the render's context once after lines have been
+// written, and keeps recording whatever the formatter emits afterwards so the
+// test can prove the remainder was never produced.
+type cancelAfterWriter struct {
+	buf    bytes.Buffer
+	cancel context.CancelFunc
+	after  int
+	lines  int
+}
+
+func (w *cancelAfterWriter) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	w.lines += bytes.Count(p, []byte("\n"))
+	if w.cancel != nil && w.lines >= w.after {
+		w.cancel()
+		w.cancel = nil
+	}
+	return n, err
+}
+
+func TestFormatterCancelledMidRender(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *model.Config
+		results *aggregator.AggregatedResults
+	}{
+		{
+			name:    "grouped",
+			cfg:     &model.Config{Heading: true, LineNumber: true, Color: model.ColorNever},
+			results: makeLargeAggregatedResults(8, 512),
+		},
+		{
+			name:    "single",
+			cfg:     &model.Config{Heading: false, LineNumber: true, Color: model.ColorNever},
+			results: makeLargeAggregatedResults(8, 512),
+		},
+		{
+			name:    "count",
+			cfg:     &model.Config{Count: true, Color: model.ColorNever},
+			results: makeLargeAggregatedResults(3000, 1),
+		},
+		{
+			name:    "files-with-matches",
+			cfg:     &model.Config{FilesWithMatches: true, Color: model.ColorNever},
+			results: makeLargeAggregatedResults(3000, 1),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var full bytes.Buffer
+			if err := NewFormatter(tc.cfg).Format(context.Background(), &full, tc.results); err != nil {
+				t.Fatalf("uncancelled render failed: %v", err)
+			}
+			want := full.String()
+			if lines := strings.Count(want, "\n"); lines <= 2*cancelCheckInterval {
+				t.Fatalf("fixture renders %d lines, too few to span several check intervals", lines)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := &cancelAfterWriter{cancel: cancel, after: 10}
+
+			err := NewFormatter(tc.cfg).Format(ctx, w, tc.results)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected context.Canceled, got %v", err)
+			}
+
+			got := w.buf.String()
+			if got == "" {
+				t.Fatal("expected the output written before cancellation to be retained")
+			}
+			if len(got) >= len(want) {
+				t.Fatalf("cancellation emitted %d of %d bytes: the remainder was not skipped", len(got), len(want))
+			}
+			if !strings.HasPrefix(want, got) {
+				t.Fatalf("output after cancellation is not a prefix of the full render (%d bytes written)", len(got))
+			}
+			if !strings.HasSuffix(got, "\n") {
+				t.Fatalf("cancellation truncated mid-line: %q", got[max(0, len(got)-64):])
+			}
+		})
+	}
+}
+
+func TestFormatterAlreadyCancelledEmitsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cfg := &model.Config{Heading: true, LineNumber: true, Color: model.ColorNever}
+	var buf bytes.Buffer
+	err := NewFormatter(cfg).Format(ctx, &buf, makeTestAggregatedResults())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected no output for an already-cancelled context, got %q", buf.String())
 	}
 }

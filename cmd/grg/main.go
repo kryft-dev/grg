@@ -202,12 +202,13 @@ func emitResults(ctx context.Context, cfg *model.Config, results []*search.BlobR
 		return noMatchError{}
 	}
 
-	if err := ctx.Err(); err != nil {
-		return cancelError{err: err, quiet: cfg.Quiet}
-	}
-
+	// Rendering is cancellable: Format observes ctx at coarse boundaries, so the
+	// pre-flight check is folded into the render itself.
 	formatter := output.NewFormatter(cfg)
-	if err := formatter.Format(stdout, aggregated); err != nil {
+	if err := formatter.Format(ctx, stdout, aggregated); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return cancelError{err: err, quiet: cfg.Quiet}
+		}
 		return err
 	}
 

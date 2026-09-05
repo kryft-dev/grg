@@ -402,7 +402,7 @@ func TestGoroutineLeak_EndToEndLifecycle(t *testing.T) {
 
 	var outBuf bytes.Buffer
 	formatter := output.NewFormatter(cfg)
-	if err := formatter.Format(&outBuf, aggregated); err != nil {
+	if err := formatter.Format(context.Background(), &outBuf, aggregated); err != nil {
 		t.Fatalf("formatter.Format failed: %v", err)
 	}
 
