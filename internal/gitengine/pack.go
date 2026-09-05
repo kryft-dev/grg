@@ -11,8 +11,10 @@ import (
 	"sync"
 )
 
+// packMagic is the 4-byte header magic of a .pack file.
+const packMagic = "PACK"
+
 var (
-	packMagic = []byte{'P', 'A', 'C', 'K'}
 	// ErrPackInvalid indicates a malformed or unsupported packfile.
 	ErrPackInvalid = errors.New("invalid packfile")
 )
@@ -68,7 +70,7 @@ func OpenPackfile(packPath, idxPath string) (*PackReader, error) {
 		return nil, fmt.Errorf("%w: failed to read pack header: %v", ErrPackInvalid, err)
 	}
 
-	if string(hdr[:4]) != string(packMagic) {
+	if string(hdr[:4]) != packMagic {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: invalid pack magic %q", ErrPackInvalid, string(hdr[:4]))
 	}

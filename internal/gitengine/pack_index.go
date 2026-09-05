@@ -10,11 +10,11 @@ import (
 	"os"
 )
 
-var (
-	idxV2Magic = []byte{0xff, 0x74, 0x4f, 0x63} // \xfftOc
-	// ErrIdxInvalid indicates an invalid or unsupported .idx file.
-	ErrIdxInvalid = errors.New("invalid pack index file")
-)
+// idxV2Magic is the 4-byte header magic of a .idx v2 file ("\xfftOc").
+const idxV2Magic = "\xff\x74\x4f\x63"
+
+// ErrIdxInvalid indicates an invalid or unsupported .idx file.
+var ErrIdxInvalid = errors.New("invalid pack index file")
 
 // PackIndex represents a parsed Git packfile .idx v2 file.
 type PackIndex struct {
@@ -43,7 +43,7 @@ func ParsePackIndex(data []byte) (*PackIndex, error) {
 	}
 
 	// 1. Verify magic and version
-	if !bytes.Equal(data[:4], idxV2Magic) {
+	if string(data[:4]) != idxV2Magic {
 		return nil, fmt.Errorf("%w: invalid header magic %x", ErrIdxInvalid, data[:4])
 	}
 	version := binary.BigEndian.Uint32(data[4:8])

@@ -109,7 +109,7 @@ func buildTestPackAndIdx(objects []testPackObj) (packData []byte, idxData []byte
 	})
 
 	var idxBuf bytes.Buffer
-	idxBuf.Write(idxV2Magic)
+	idxBuf.WriteString(idxV2Magic)
 	_ = binary.Write(&idxBuf, binary.BigEndian, uint32(2))
 
 	// Fanout table
