@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -12,6 +13,12 @@ import (
 )
 
 // BlobResult contains search matches and all provenance occurrences for a deduplicated blob OID.
+//
+// Error is set when the blob could not be searched. A *BlobReadError is a soft
+// failure: the pipeline still delivers the result (with no matches) on the results
+// channel so callers can warn about it, but does not report it on the error channel
+// and the search continues. Any other error is fatal and also surfaces on the error
+// channel.
 type BlobResult struct {
 	BlobOID       string
 	Occurrences   []model.BlobOccurrence
@@ -20,6 +27,29 @@ type BlobResult struct {
 	Lines         []string
 	IsBinary      bool
 	Error         error
+}
+
+// BlobReadError reports that a blob could not be read from the object store
+// (missing, truncated, or corrupt object) and was skipped by the search.
+// Path is the first occurrence path of the blob, for diagnostics.
+type BlobReadError struct {
+	OID  string
+	Path string
+	Err  error
+}
+
+func (e *BlobReadError) Error() string {
+	return fmt.Sprintf("failed to read blob %s: %v", e.OID, e.Err)
+}
+
+func (e *BlobReadError) Unwrap() error {
+	return e.Err
+}
+
+// isBlobReadError reports whether err is (or wraps) a soft per-blob read failure.
+func isBlobReadError(err error) bool {
+	var bre *BlobReadError
+	return errors.As(err, &bre)
 }
 
 // Pipeline coordinates concurrent blob decompression, search matching, and provenance association.
@@ -133,7 +163,9 @@ func (p *Pipeline) ExecuteContext(ctx context.Context, occurrences []model.BlobO
 						continue
 					}
 					res := p.processTask(ctx, task)
-					if res.Error != nil {
+					// Soft per-blob read failures are delivered on resultsCh only; every
+					// other error is fatal and also reported on errCh.
+					if res.Error != nil && !isBlobReadError(res.Error) {
 						select {
 						case errCh <- res.Error:
 						default:
@@ -216,7 +248,11 @@ func (p *Pipeline) processTask(ctx context.Context, task *blobTask) *BlobResult 
 
 	obj, err := p.reader.ReadObject(task.oid)
 	if err != nil {
-		res.Error = fmt.Errorf("failed to read blob %s: %w", task.oid, err)
+		var path string
+		if len(task.occurrences) > 0 {
+			path = task.occurrences[0].Path
+		}
+		res.Error = &BlobReadError{OID: task.oid, Path: path, Err: err}
 		return res
 	}
 

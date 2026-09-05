@@ -39,102 +39,6 @@ func main() {
 	}
 }
 
-type exitCoder interface {
-	ExitCode() int
-}
-
-type quietChecker interface {
-	IsQuiet() bool
-}
-
-type repoError struct {
-	err error
-}
-
-func (r repoError) Error() string {
-	return r.err.Error()
-}
-
-func (r repoError) ExitCode() int {
-	return 2
-}
-
-func (r repoError) Unwrap() error {
-	return r.err
-}
-
-type cliError struct {
-	err error
-}
-
-func (c cliError) Error() string {
-	return c.err.Error()
-}
-
-func (c cliError) ExitCode() int {
-	return 2
-}
-
-func (c cliError) Unwrap() error {
-	return c.err
-}
-
-type cancelError struct {
-	err   error
-	quiet bool
-}
-
-func (c cancelError) Error() string {
-	if c.err != nil {
-		return c.err.Error()
-	}
-	return "operation canceled"
-}
-
-func (c cancelError) ExitCode() int {
-	return 2
-}
-
-func (c cancelError) IsQuiet() bool {
-	return c.quiet
-}
-
-func (c cancelError) Unwrap() error {
-	return c.err
-}
-
-type noMatchError struct{}
-
-func (n noMatchError) Error() string {
-	return "no matches found"
-}
-
-func (n noMatchError) ExitCode() int {
-	return 1
-}
-
-func isQuietError(err error) bool {
-	var qc quietChecker
-	if errors.As(err, &qc) {
-		return qc.IsQuiet()
-	}
-	return false
-}
-
-func exitCodeForError(err error) int {
-	if err == nil {
-		return 0
-	}
-	var ec exitCoder
-	if errors.As(err, &ec) {
-		return ec.ExitCode()
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return 2
-	}
-	return 2
-}
-
 func run(args []string) error {
 	return runContext(context.Background(), args, os.Stdout, os.Stderr)
 }
@@ -264,7 +168,33 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return cancelError{err: err, quiet: cfg.Quiet}
 	}
 
-	if len(results) == 0 {
+	// Warn about unreadable blobs before any match output so stdout stays clean.
+	skipped := reportSkippedBlobs(stderr, results)
+
+	return withSkippedBlobs(emitResults(ctx, cfg, results, stdout), skipped, cfg.Quiet)
+}
+
+// reportSkippedBlobs writes one warning line per blob the pipeline could not read
+// and returns how many were skipped.
+func reportSkippedBlobs(stderr io.Writer, results []*search.BlobResult) int {
+	skipped := 0
+	for _, res := range results {
+		if res == nil {
+			continue
+		}
+		var bre *search.BlobReadError
+		if errors.As(res.Error, &bre) {
+			skipped++
+			fmt.Fprintf(stderr, "grg: warning: skipping blob %s (%s): %v\n", bre.OID, bre.Path, bre.Err)
+		}
+	}
+	return skipped
+}
+
+// emitResults aggregates and renders the search results, returning noMatchError
+// when nothing matched. Under --quiet nothing is written to stdout.
+func emitResults(ctx context.Context, cfg *model.Config, results []*search.BlobResult, stdout io.Writer) error {
+	if !hasMatches(results) {
 		return noMatchError{}
 	}
 
@@ -290,6 +220,17 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 
 	return nil
+}
+
+// hasMatches reports whether any result carries a text or binary match.
+// Results for skipped blobs carry only an error and do not count.
+func hasMatches(results []*search.BlobResult) bool {
+	for _, res := range results {
+		if res != nil && (len(res.Matches) > 0 || res.IsBinary) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildPathFilter(repo *gitengine.RepoInfo, cfg *model.Config) (func(path string) bool, error) {

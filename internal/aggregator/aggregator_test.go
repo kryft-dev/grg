@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kryft-dev/grg/internal/gitengine"
 	"github.com/kryft-dev/grg/internal/model"
 	"github.com/kryft-dev/grg/internal/search"
 )
@@ -306,3 +307,41 @@ func TestAggregator_AggregateChannel_BlobError(t *testing.T) {
 	}
 }
 
+// A *search.BlobReadError is a soft failure: the result is skipped and the
+// remaining results still aggregate (regression #10).
+func TestAggregator_AggregateChannel_SkipsBlobReadError(t *testing.T) {
+	agg := New(&model.Config{})
+	resultsCh := make(chan *search.BlobResult, 3)
+	errCh := make(chan error)
+
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	resultsCh <- &search.BlobResult{
+		BlobOID:     "good1",
+		Matches:     []model.SearchMatch{{LineNum: 1, LineText: "needle"}},
+		Occurrences: []model.BlobOccurrence{{Path: "a.txt", CommitSHA: "c1", CommitDate: t1}},
+	}
+	resultsCh <- &search.BlobResult{
+		BlobOID:     "bad",
+		Occurrences: []model.BlobOccurrence{{Path: "gone.txt", CommitSHA: "c1", CommitDate: t1}},
+		Error:       &search.BlobReadError{OID: "bad", Path: "gone.txt", Err: gitengine.ErrObjectNotFound},
+	}
+	resultsCh <- &search.BlobResult{
+		BlobOID:     "good2",
+		Matches:     []model.SearchMatch{{LineNum: 2, LineText: "needle again"}},
+		Occurrences: []model.BlobOccurrence{{Path: "b.txt", CommitSHA: "c1", CommitDate: t1}},
+	}
+	close(resultsCh)
+
+	out, err := agg.AggregateChannel(context.Background(), resultsCh, errCh)
+	if err != nil {
+		t.Fatalf("unreadable blob must not abort aggregation, got: %v", err)
+	}
+	if out == nil || out.TotalFiles != 2 || out.TotalMatches != 2 {
+		t.Fatalf("expected 2 files / 2 matches from the readable blobs, got %+v", out)
+	}
+	for _, f := range out.Files {
+		if f.Path == "gone.txt" {
+			t.Errorf("skipped blob must not appear in aggregated files")
+		}
+	}
+}

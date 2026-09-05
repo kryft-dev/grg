@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
@@ -14,11 +15,15 @@ import (
 )
 
 type mockSearchReader struct {
-	objects map[string]*gitengine.Object
+	objects  map[string]*gitengine.Object
+	failWith map[string]error // OIDs whose ReadObject returns the given error
 }
 
 func newMockSearchReader() *mockSearchReader {
-	return &mockSearchReader{objects: make(map[string]*gitengine.Object)}
+	return &mockSearchReader{
+		objects:  make(map[string]*gitengine.Object),
+		failWith: make(map[string]error),
+	}
 }
 
 func (m *mockSearchReader) putBlob(content []byte) string {
@@ -36,6 +41,9 @@ func (m *mockSearchReader) putBlob(content []byte) string {
 }
 
 func (m *mockSearchReader) ReadObject(oid string) (*gitengine.Object, error) {
+	if err, ok := m.failWith[oid]; ok {
+		return nil, err
+	}
 	if obj, ok := m.objects[oid]; ok {
 		return obj, nil
 	}
@@ -346,6 +354,8 @@ func TestPipelineExecuteContext_Empty(t *testing.T) {
 	}
 }
 
+// A blob the reader cannot load is a soft failure: it is delivered on resultsCh
+// as a *BlobReadError so callers can warn, but never on errCh (regression #10).
 func TestPipelineExecuteContext_ReaderError(t *testing.T) {
 	reader := newMockSearchReader() // missing blob
 	occurrences := []model.BlobOccurrence{
@@ -365,13 +375,93 @@ func TestPipelineExecuteContext_ReaderError(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result with error, got %d", len(results))
 	}
-	if results[0].Error == nil {
-		t.Errorf("expected blob reading error on result")
+	var bre *BlobReadError
+	if !errors.As(results[0].Error, &bre) {
+		t.Fatalf("expected *BlobReadError on result, got %v", results[0].Error)
+	}
+	if bre.OID != "nonexistent_oid" || bre.Path != "missing.txt" {
+		t.Errorf("unexpected BlobReadError fields: %+v", bre)
+	}
+	if !errors.Is(bre, gitengine.ErrObjectNotFound) {
+		t.Errorf("expected BlobReadError to wrap ErrObjectNotFound, got %v", bre.Err)
 	}
 
-	err := <-errCh
-	if err == nil {
-		t.Errorf("expected error propagated to errCh")
+	if err := <-errCh; err != nil {
+		t.Errorf("blob read failure must not be fatal, got error on errCh: %v", err)
 	}
 }
 
+// One unreadable blob must not abort the search: every other blob still yields
+// its matches and the failing OID is reported as a soft *BlobReadError.
+func TestPipelineSkipsUnreadableBlob(t *testing.T) {
+	tests := []struct {
+		name    string
+		readErr error
+	}{
+		{name: "object not found", readErr: gitengine.ErrObjectNotFound},
+		{name: "corrupt object", readErr: fmt.Errorf("%w: bad zlib stream", gitengine.ErrCorruptObject)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newMockSearchReader()
+			good1 := reader.putBlob([]byte("needle in first blob\n"))
+			bad := reader.putBlob([]byte("needle in unreadable blob\n"))
+			good2 := reader.putBlob([]byte("needle in third blob\n"))
+			reader.failWith[bad] = tt.readErr
+
+			occurrences := []model.BlobOccurrence{
+				{BlobOID: good1, Path: "a.txt", CommitSHA: "c1", Mode: 0100644},
+				{BlobOID: bad, Path: "gone.txt", CommitSHA: "c1", Mode: 0100644},
+				{BlobOID: bad, Path: "gone-renamed.txt", CommitSHA: "c2", Mode: 0100644},
+				{BlobOID: good2, Path: "b.txt", CommitSHA: "c2", Mode: 0100644},
+			}
+
+			cfg := &model.Config{Pattern: "needle"}
+			matcher, err := NewMatcher(cfg)
+			if err != nil {
+				t.Fatalf("NewMatcher failed: %v", err)
+			}
+
+			results, err := NewPipeline(reader, matcher, cfg).Execute(occurrences)
+			if err != nil {
+				t.Fatalf("pipeline must not fail on an unreadable blob, got: %v", err)
+			}
+
+			byOID := make(map[string]*BlobResult, len(results))
+			for _, r := range results {
+				byOID[r.BlobOID] = r
+			}
+			for _, oid := range []string{good1, good2} {
+				res, ok := byOID[oid]
+				if !ok {
+					t.Fatalf("missing result for readable blob %s", oid)
+				}
+				if res.Error != nil || len(res.Matches) != 1 {
+					t.Errorf("readable blob %s: want 1 match and no error, got %d matches, err=%v", oid, len(res.Matches), res.Error)
+				}
+			}
+
+			res, ok := byOID[bad]
+			if !ok {
+				t.Fatalf("expected a result carrying the read failure for %s", bad)
+			}
+			var bre *BlobReadError
+			if !errors.As(res.Error, &bre) {
+				t.Fatalf("expected *BlobReadError, got %v", res.Error)
+			}
+			if bre.OID != bad {
+				t.Errorf("BlobReadError.OID = %s, want %s", bre.OID, bad)
+			}
+			if bre.Path != "gone.txt" {
+				t.Errorf("BlobReadError.Path = %q, want first occurrence path %q", bre.Path, "gone.txt")
+			}
+			if !errors.Is(bre, tt.readErr) {
+				t.Errorf("BlobReadError should wrap %v, got %v", tt.readErr, bre.Err)
+			}
+			if len(res.Matches) != 0 {
+				t.Errorf("skipped blob must contribute no matches, got %d", len(res.Matches))
+			}
+		})
+	}
+}
