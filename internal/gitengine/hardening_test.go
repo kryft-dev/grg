@@ -3,6 +3,7 @@ package gitengine
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -193,32 +194,103 @@ func TestSafety_Walker_DeepLinearHistory(t *testing.T) {
 	}
 }
 
-// SEC-15: Concurrency safety in RepositoryReader (concurrent ReadObject and Close)
+// SEC-15: Concurrency safety in RepositoryReader (concurrent ReadObject and Close).
+//
+// Close closes the *os.File behind every PackReader, so a read that is already in
+// flight must not be handed a closed descriptor: ReadAt would fail with
+// os.ErrFileClosed, which the reader used to swallow and report as
+// ErrObjectNotFound — a silent wrong answer that -race cannot see. Every read here
+// must therefore either succeed with the real payload or fail with ErrReaderClosed.
 func TestConcurrency_RepositoryReader_Deadlock(t *testing.T) {
-	reader := &RepositoryReader{}
+	content := []byte("payload read concurrently with Close")
+	obj, sha := blobObject(content)
+	gitDir := writeTestPack(t, "concurrent", []testPackObj{obj})
+	oid := hex.EncodeToString(sha[:])
+
+	reader, err := NewRepositoryReader(&RepoInfo{CommonGitDir: gitDir})
+	if err != nil {
+		t.Fatalf("NewRepositoryReader failed: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
 
 	var wg sync.WaitGroup
-	// Run concurrent ReadObject and Close calls
-	for i := 0; i < 20; i++ {
+	start := make(chan struct{})
+
+	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				_, _ = reader.ReadObject("0123456789abcdef0123456789abcdef01234567")
-				_ = reader.HasObject("0123456789abcdef0123456789abcdef01234567")
+			<-start
+			for range 100 {
+				got, err := reader.ReadObject(oid)
+				switch {
+				case err == nil:
+					if !bytes.Equal(got.Data, content) {
+						t.Errorf("ReadObject returned wrong payload %q", got.Data)
+					}
+				case errors.Is(err, ErrObjectNotFound):
+					t.Errorf("a packed object was reported missing during shutdown: %v", err)
+				case !errors.Is(err, ErrReaderClosed):
+					t.Errorf("expected ErrReaderClosed, got %v", err)
+				}
+				// Exercised for lock coverage: a closed reader reports absence.
+				_ = reader.HasObject(oid)
 			}
 		}()
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = reader.Close()
+			<-start
+			if err := reader.Close(); err != nil {
+				t.Errorf("Close failed: %v", err)
+			}
 		}()
 	}
 
+	close(start)
 	wg.Wait()
+
+	// After Close, reads report the reader as closed rather than the object missing.
+	if _, err := reader.ReadObject(oid); !errors.Is(err, ErrReaderClosed) {
+		t.Fatalf("expected ErrReaderClosed after Close, got %v", err)
+	}
+	if reader.HasObject(oid) {
+		t.Error("HasObject should report false after Close")
+	}
+}
+
+// PERF-05: a delta target that outgrows the pooled buffer must be written back
+// through the caller's pointer, otherwise the caller recycles the small buffer
+// forever and the pool is defeated on exactly the objects it exists for.
+func TestPerformance_ApplyDeltaWithBuffer_GrowsCallerBuffer(t *testing.T) {
+	base := bytes.Repeat([]byte("g"), 4096)
+	targetSize := len(base) + 3
+
+	var delta []byte
+	delta = append(delta, encodeLEB128(len(base))...)
+	delta = append(delta, encodeLEB128(targetSize)...)
+	// Copy all of base: 2 offset bytes (0) and 2 size bytes (4096).
+	delta = append(delta, 0x80|0x01|0x02|0x10|0x20, 0x00, 0x00, 0x00, 0x10)
+	// Insert three literal bytes.
+	delta = append(delta, 3, 'e', 'n', 'd')
+
+	buf := make([]byte, 0, 8)
+	target, err := ApplyDeltaWithBuffer(&buf, base, delta)
+	if err != nil {
+		t.Fatalf("ApplyDeltaWithBuffer failed: %v", err)
+	}
+	if len(target) != targetSize {
+		t.Fatalf("expected target size %d, got %d", targetSize, len(target))
+	}
+	if cap(buf) < targetSize {
+		t.Fatalf("caller buffer was not grown: cap %d, need %d", cap(buf), targetSize)
+	}
+	if !bytes.Equal(buf, target) {
+		t.Fatalf("caller buffer does not hold the decoded target: len %d vs %d", len(buf), len(target))
+	}
 }
 
 // PERF-04: CompareTreeEntries canonical ordering verification
