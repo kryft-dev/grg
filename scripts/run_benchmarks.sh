@@ -7,14 +7,18 @@
 
 set -uo pipefail
 
-# Color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Color codes (ANSI-C quoted so they hold real escape bytes and render in heredocs too)
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[1;33m'
+  BLUE=$'\033[1;34m'
+  CYAN=$'\033[0;36m'
+  BOLD=$'\033[1m'
+  NC=$'\033[0m' # No Color
+else
+  RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' NC=''
+fi
 
 # Configuration defaults
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
